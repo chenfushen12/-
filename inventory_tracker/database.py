@@ -255,6 +255,17 @@ class Database:
         ).fetchone()
         return str(row["source_hash"]) if row else None
 
+    def template_version_by_hash(self, source_hash: str) -> int | None:
+        row = self.connection.execute(
+            "SELECT id FROM template_versions WHERE source_hash = ? ORDER BY id DESC LIMIT 1",
+            (source_hash,),
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def activate_template_version(self, version_id: int) -> None:
+        self.connection.execute("UPDATE template_versions SET is_active = 0")
+        self.connection.execute("UPDATE template_versions SET is_active = 1 WHERE id = ?", (version_id,))
+
     def template_by_id(self, version_id: int) -> pd.DataFrame:
         rows = self.connection.execute(
             "SELECT category, groupcode, groupname, product_id, product_name, note FROM products WHERE template_version_id = ?",

@@ -81,7 +81,7 @@ class InventoryTrackerService:
             if preview.file_hash in ignored:
                 continue
             if self.database.has_import_hash(preview.file_hash):
-                raise DuplicateImportError(f"文件已导入: {preview.source_path}")
+                raise DuplicateImportError(f"{preview.kind} 文件已导入: {preview.source_path}")
 
     @staticmethod
     def _add_future_date_issue(preview: ImportPreview, snapshot_date: date) -> None:
@@ -129,7 +129,8 @@ class InventoryTrackerService:
             raise ConfirmationRequired("必须在预览后确认导入")
         previews = (template_preview, sales_preview, beijing_preview, xingwang_preview)
         self._add_future_date_issue(sales_preview, snapshot_date)
-        reuse_template = self.database.active_template_source_hash() == template_preview.file_hash
+        existing_template_version = self.database.template_version_by_hash(template_preview.file_hash)
+        reuse_template = existing_template_version is not None
         try:
             self._validate_previews(previews, ignored_hashes={template_preview.file_hash} if reuse_template else set())
         except ValidationError:
@@ -144,10 +145,9 @@ class InventoryTrackerService:
         stored_paths = {preview.kind: self._store_raw(preview, snapshot_date) for preview in previews}
         with self.database.transaction():
             if reuse_template:
-                active_template = self.database.active_template()
-                if active_template is None:
-                    raise ValidationError("找不到已启用的商品主模板")
-                template_version_id = active_template[0]
+                assert existing_template_version is not None
+                self.database.activate_template_version(existing_template_version)
+                template_version_id = existing_template_version
             else:
                 self.database.insert_import_log(
                     kind="template",
