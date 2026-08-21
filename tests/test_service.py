@@ -126,3 +126,34 @@ def test_future_sales_dates_are_reported_and_excluded(tmp_path) -> None:
 
     assert any(issue.code == "future_sales_date" for issue in result.report.infos)
     assert result.frame.iloc[0]["sales"] is None
+
+
+def test_same_active_template_can_be_reused_for_another_snapshot_date(tmp_path) -> None:
+    template, sales, beijing, xingwang = _write_inputs(tmp_path)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    first = (
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+    service.commit_batch(*first, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    sales_second = tmp_path / "sales-second.xlsx"
+    beijing_second = tmp_path / "beijing-second.xlsx"
+    xingwang_second = tmp_path / "xingwang-second.xlsx"
+    pd.DataFrame([{"时间": "2026-08-11", "GROUP CODE": "G1", "货品编号": "001", "数量": 12}]).to_excel(sales_second, index=False)
+    pd.DataFrame([{"库房": "CB", "产品组": "G1", "产品": "001", "可用数": 21}]).to_excel(beijing_second, index=False)
+    pd.DataFrame([{"GROUPCODE(货)": "G1", "货品编号": "001", "可用库存": 11, "采购在途": 5, "近90天销量(库存公式)": 10, "近30天销量": 10}]).to_excel(xingwang_second, index=False)
+    second = (
+        preview_template(template),
+        preview_sales(sales_second),
+        preview_beijing(beijing_second, codes=("CB",)),
+        preview_xingwang(xingwang_second),
+    )
+
+    result = service.commit_batch(*second, snapshot_date=date(2026, 8, 11), confirmed=True)
+
+    assert result.status == "complete"
+    assert len(service.get_snapshot(date(2026, 8, 10))) == 1
+    assert len(service.get_snapshot(date(2026, 8, 11))) == 1

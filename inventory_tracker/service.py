@@ -72,11 +72,14 @@ class InventoryTrackerService:
             ensure_ascii=False,
         )
 
-    def _validate_previews(self, previews: tuple[ImportPreview, ...]) -> None:
+    def _validate_previews(self, previews: tuple[ImportPreview, ...], *, ignored_hashes: set[str] | None = None) -> None:
+        ignored = ignored_hashes or set()
         blocking = [issue for preview in previews for issue in preview.report.blocking]
         if blocking:
             raise ValidationError("导入包含阻断问题: " + "；".join(issue.message for issue in blocking[:5]))
         for preview in previews:
+            if preview.file_hash in ignored:
+                continue
             if self.database.has_import_hash(preview.file_hash):
                 raise DuplicateImportError(f"文件已导入: {preview.source_path}")
 
@@ -126,8 +129,9 @@ class InventoryTrackerService:
             raise ConfirmationRequired("必须在预览后确认导入")
         previews = (template_preview, sales_preview, beijing_preview, xingwang_preview)
         self._add_future_date_issue(sales_preview, snapshot_date)
+        reuse_template = self.database.active_template_source_hash() == template_preview.file_hash
         try:
-            self._validate_previews(previews)
+            self._validate_previews(previews, ignored_hashes={template_preview.file_hash} if reuse_template else set())
         except ValidationError:
             self._record_rejected_previews(previews, snapshot_date)
             raise
@@ -139,21 +143,27 @@ class InventoryTrackerService:
 
         stored_paths = {preview.kind: self._store_raw(preview, snapshot_date) for preview in previews}
         with self.database.transaction():
-            self.database.insert_import_log(
-                kind="template",
-                source_path=template_preview.source_path,
-                stored_path=stored_paths["template"],
-                file_hash=template_preview.file_hash,
-                business_date=snapshot_date,
-                mode="activate",
-                status="committed",
-                report_json=self._report_json(template_preview.report),
-            )
-            template_version_id = self.database.insert_template(
-                template_preview.frame,
-                source_hash=template_preview.file_hash,
-                stored_path=stored_paths["template"],
-            )
+            if reuse_template:
+                active_template = self.database.active_template()
+                if active_template is None:
+                    raise ValidationError("找不到已启用的商品主模板")
+                template_version_id = active_template[0]
+            else:
+                self.database.insert_import_log(
+                    kind="template",
+                    source_path=template_preview.source_path,
+                    stored_path=stored_paths["template"],
+                    file_hash=template_preview.file_hash,
+                    business_date=snapshot_date,
+                    mode="activate",
+                    status="committed",
+                    report_json=self._report_json(template_preview.report),
+                )
+                template_version_id = self.database.insert_template(
+                    template_preview.frame,
+                    source_hash=template_preview.file_hash,
+                    stored_path=stored_paths["template"],
+                )
             sales_log = self.database.insert_import_log(
                 kind="sales",
                 source_path=sales_preview.source_path,

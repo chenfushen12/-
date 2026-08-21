@@ -101,7 +101,17 @@ def _clean_keys(
         result[column] = result[column].map(_clean_key)
     missing = result["groupcode"].isna() | result["product_id"].isna()
     for index in result.index[missing]:
-        report.add(missing_level, code, "缺少商品主键的行被排除", row=int(index) + 2)
+        missing_fields = []
+        if pd.isna(result.loc[index, "groupcode"]):
+            missing_fields.append("GROUPCODE")
+        if pd.isna(result.loc[index, "product_id"]):
+            missing_fields.append("货品编号")
+        report.add(
+            missing_level,
+            code,
+            f"第 {int(index) + 2} 行缺少商品主键（{', '.join(missing_fields)}），无法匹配追踪商品，已排除",
+            row=int(index) + 2,
+        )
     return result.loc[~missing].copy()
 
 

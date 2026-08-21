@@ -156,7 +156,7 @@ class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path)
+        self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
@@ -248,6 +248,12 @@ class Database:
             (version["id"],),
         ).fetchall()
         return int(version["id"]), pd.DataFrame.from_records([dict(row) for row in rows])
+
+    def active_template_source_hash(self) -> str | None:
+        row = self.connection.execute(
+            "SELECT source_hash FROM template_versions WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return str(row["source_hash"]) if row else None
 
     def template_by_id(self, version_id: int) -> pd.DataFrame:
         rows = self.connection.execute(

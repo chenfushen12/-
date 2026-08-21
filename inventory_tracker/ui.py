@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import tkinter as tk
 from datetime import date, timedelta
 from pathlib import Path
@@ -25,6 +26,15 @@ def _format_number(value: object) -> str:
     if isinstance(value, float):
         return f"{value:.2f}"
     return str(value)
+
+
+def _configure_matplotlib_chinese_font() -> None:
+    from matplotlib import font_manager, rcParams
+
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    preferred = [name for name in ("Microsoft YaHei", "SimHei", "Microsoft JhengHei", "Noto Sans CJK SC") if name in available]
+    rcParams["font.sans-serif"] = preferred or ["DejaVu Sans"]
+    rcParams["axes.unicode_minus"] = False
 
 
 class InventoryApp:
@@ -159,8 +169,14 @@ class InventoryApp:
         options.pack(fill="x", pady=10)
         self.replace_sales = tk.BooleanVar(value=False)
         ttk.Checkbutton(options, text="销售日期重叠时按日期替换", variable=self.replace_sales).pack(side="left")
-        ttk.Button(options, text="预检查并预览", command=self._preview_import).pack(side="left", padx=8)
-        ttk.Button(options, text="确认导入并计算", command=self._commit_import).pack(side="left")
+        self.preview_button = ttk.Button(options, text="预检查并预览", command=self._preview_import)
+        self.preview_button.pack(side="left", padx=8)
+        self.commit_button = ttk.Button(options, text="确认导入并计算", command=self._commit_import)
+        self.commit_button.pack(side="left")
+        self.import_progress = ttk.Progressbar(options, orient="horizontal", mode="determinate", maximum=100, length=260)
+        self.import_progress.pack(side="left", padx=12)
+        self.progress_var = tk.StringVar(value="")
+        ttk.Label(options, textvariable=self.progress_var, width=24).pack(side="left")
         self.import_status = tk.StringVar(value="请选择四个 Excel 文件并执行预检查")
         ttk.Label(self.import_tab, textvariable=self.import_status, foreground="#375a7f").pack(anchor="w", pady=8)
         self.preview_text = tk.Text(self.import_tab, height=22, wrap="word")
@@ -190,30 +206,76 @@ class InventoryApp:
         if path:
             self.file_vars[key].set(path)
 
+    def _set_import_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.preview_button.configure(state=state)
+        self.commit_button.configure(state=state)
+        if not busy:
+            self.import_progress.stop()
+            self.import_progress.configure(mode="determinate", value=0)
+            self.progress_var.set("")
+
+    def _start_background_task(self, work, on_success, *, indeterminate: bool = False) -> None:
+        self._set_import_busy(True)
+        self.import_progress.configure(mode="indeterminate" if indeterminate else "determinate")
+        if indeterminate:
+            self.import_progress.start(12)
+
+        def update_progress(value: int, message: str) -> None:
+            self.root.after(0, lambda: (self.import_progress.configure(value=value), self.progress_var.set(message)))
+
+        def worker() -> None:
+            try:
+                result = work(update_progress)
+            except Exception as error:
+                self.root.after(0, lambda error=error: (self._set_import_busy(False), self._show_background_error(error)))
+            else:
+                self.root.after(0, lambda: (self._set_import_busy(False), on_success(result)))
+
+        threading.Thread(target=worker, name="inventory-import", daemon=True).start()
+
+    @staticmethod
+    def _show_background_error(error: Exception) -> None:
+        if isinstance(error, OverlapError):
+            messagebox.showwarning("销售日期重叠", str(error) + "；勾选替换选项后重试")
+        else:
+            messagebox.showerror("导入失败", str(error))
+
     def _preview_import(self) -> None:
         try:
             snapshot_date = _parse_date(self.snapshot_date.get())
             paths = {key: variable.get().strip() for key, variable in self.file_vars.items()}
             if not all(paths.values()):
                 raise ValueError("四个 Excel 文件都必须选择")
-            previews = (
-                preview_template(paths["template"]),
-                preview_sales(paths["sales"]),
-                preview_beijing(paths["beijing"], codes=self.service.config.beijing_codes),
-                preview_xingwang(paths["xingwang"]),
-            )
-            self.previews = previews
-            self.last_report = report = self._combine_reports(previews)
-            self._show_report(report)
-            lines = []
-            for preview in previews:
-                lines.append(f"{preview.kind}: {len(preview.frame)} 行，文件哈希 {preview.file_hash[:12]}…")
-                lines.extend(f"  [{issue.level.value}] {issue.message}" for issue in preview.report.issues[:8])
-            self.preview_text.delete("1.0", "end")
-            self.preview_text.insert("end", "\n".join(lines))
-            self.import_status.set(f"预检查完成：{len(report.blocking)} 个阻断，{len(report.warnings)} 个警告，{len(report.infos)} 个提示；快照日 {snapshot_date}")
+            def work(progress):
+                progress(5, "读取商品主模板…")
+                template = preview_template(paths["template"])
+                progress(30, "读取销售数据…")
+                sales = preview_sales(paths["sales"])
+                progress(55, "读取北京库存…")
+                beijing = preview_beijing(paths["beijing"], codes=self.service.config.beijing_codes)
+                progress(80, "读取星望库存…")
+                xingwang = preview_xingwang(paths["xingwang"])
+                progress(100, "预检查完成")
+                return snapshot_date, (template, sales, beijing, xingwang)
+
+            self.import_status.set("后台读取中，窗口仍可操作…")
+            self._start_background_task(work, self._apply_preview_result)
         except Exception as error:
             messagebox.showerror("预检查失败", str(error))
+
+    def _apply_preview_result(self, result) -> None:
+        snapshot_date, previews = result
+        self.previews = previews
+        self.last_report = report = self._combine_reports(previews)
+        self._show_report(report)
+        lines = []
+        for preview in previews:
+            lines.append(f"{preview.kind}: {len(preview.frame)} 行，文件哈希 {preview.file_hash[:12]}…")
+            lines.extend(f"  [{issue.level.value}] {issue.message}" for issue in preview.report.issues[:8])
+        self.preview_text.delete("1.0", "end")
+        self.preview_text.insert("end", "\n".join(lines))
+        self.import_status.set(f"预检查完成：{len(report.blocking)} 个阻断，{len(report.warnings)} 个警告，{len(report.infos)} 个提示；快照日 {snapshot_date}")
 
     @staticmethod
     def _combine_reports(previews) -> object:
@@ -235,19 +297,32 @@ class InventoryApp:
         if not messagebox.askyesno("确认导入", "确认写入四类数据并生成库存快照吗？"):
             return
         try:
-            result = self.service.commit_batch(
-                *self.previews,
-                snapshot_date=_parse_date(self.snapshot_date.get()),
-                confirmed=True,
-                sales_mode="replace" if self.replace_sales.get() else "append",
-            )
-            self.import_status.set(f"导入成功：{result.status}，已生成 {len(result.frame)} 个商品结果")
-            self._refresh_dashboard()
-            self.notebook.select(self.dashboard_tab)
+            snapshot_date = _parse_date(self.snapshot_date.get())
+            sales_mode = "replace" if self.replace_sales.get() else "append"
+
+            def work(progress):
+                progress(10, "校验并保存原始文件…")
+                result = self.service.commit_batch(
+                    *self.previews,
+                    snapshot_date=snapshot_date,
+                    confirmed=True,
+                    sales_mode=sales_mode,
+                )
+                progress(100, "快照计算完成")
+                return result
+
+            self.import_status.set("后台提交中，窗口仍可操作…")
+            self._start_background_task(work, self._apply_commit_result, indeterminate=True)
         except OverlapError as error:
             messagebox.showwarning("销售日期重叠", str(error) + "；勾选替换选项后重试")
         except Exception as error:
             messagebox.showerror("提交失败", str(error))
+
+    def _apply_commit_result(self, result) -> None:
+        self.import_status.set(f"导入成功：{result.status}，已生成 {len(result.frame)} 个商品结果")
+        self._show_report(result.report)
+        self._refresh_dashboard()
+        self.notebook.select(self.dashboard_tab)
 
     def _show_report(self, report) -> None:
         self.quality_text.delete("1.0", "end")
@@ -329,7 +404,11 @@ class InventoryApp:
         if history.empty:
             ttk.Label(self.chart_frame, text="暂无历史快照").pack(padx=8, pady=8)
             return
+        if len(history) < 2:
+            ttk.Label(self.chart_frame, text="当前只有一个库存快照，暂时无法形成趋势；导入更多日期后会显示历史曲线。").pack(padx=8, pady=8)
+            return
         try:
+            _configure_matplotlib_chinese_font()
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
             from matplotlib.figure import Figure
 
