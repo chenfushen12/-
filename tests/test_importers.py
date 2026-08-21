@@ -41,6 +41,25 @@ def test_template_preview_blocks_conflicting_duplicate(tmp_path) -> None:
     assert any(issue.code == "conflicting_template_duplicate" for issue in preview.report.blocking)
 
 
+def test_template_with_no_valid_keys_is_blocking(tmp_path) -> None:
+    path = tmp_path / "template.xlsx"
+    pd.DataFrame([{"货品分类": "彩片", "GROUPCODE": None, "货品编号": None}]).to_excel(path, index=False)
+
+    preview = preview_template(path)
+
+    assert not preview.report.can_commit
+    assert any(issue.code == "empty_template" for issue in preview.report.blocking)
+
+
+def test_numeric_product_key_is_blocking_to_protect_leading_zeroes(tmp_path) -> None:
+    path = tmp_path / "template.xlsx"
+    pd.DataFrame([{"货品分类": "彩片", "GROUPCODE": "G1", "货品编号": 123, "货品名称": "商品"}]).to_excel(path, index=False)
+
+    preview = preview_template(path)
+
+    assert any(issue.code == "numeric_key_format" for issue in preview.report.blocking)
+
+
 def test_sales_preview_normalizes_dates_aggregates_and_reports_missing_key(tmp_path) -> None:
     path = tmp_path / "sales.xlsx"
     pd.DataFrame(

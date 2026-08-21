@@ -92,6 +92,12 @@ class InventoryApp:
         ttk.Label(filters, text="预警").pack(side="left", padx=(16, 4))
         self.alert_filter = tk.StringVar(value="全部")
         ttk.Combobox(filters, textvariable=self.alert_filter, values=["全部", "无库存预警", "增长型缺货风险", "常规低库存", "滞销品预警", "数据质量异常"], state="readonly", width=16).pack(side="left")
+        ttk.Label(filters, text="分类").pack(side="left", padx=(16, 4))
+        self.category_filter = tk.StringVar(value="全部")
+        self.category_combo = ttk.Combobox(filters, textvariable=self.category_filter, values=["全部"], state="readonly", width=16)
+        self.category_combo.pack(side="left")
+        self.quality_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filters, text="只看数据质量", variable=self.quality_only, command=self._refresh_dashboard).pack(side="left", padx=10)
         ttk.Button(filters, text="应用筛选", command=self._refresh_dashboard).pack(side="left", padx=6)
 
         summary = ttk.Frame(self.dashboard_tab)
@@ -101,7 +107,7 @@ class InventoryApp:
 
         table_frame = ttk.Frame(self.dashboard_tab)
         table_frame.pack(fill="both", expand=True)
-        columns = ["groupcode", "product_id", "product_name", "sales", "growth", "stock_total", "sales30", "sales90", "moh30", "moh90", "alert_labels"]
+        columns = ["groupcode", "product_id", "product_name", "sales", "growth", "stock_total", "sales30", "sales90", "moh30", "moh90", "inventory_status", "alert_labels"]
         self.dashboard_columns = columns
         self.dashboard_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
         headings = {
@@ -115,6 +121,7 @@ class InventoryApp:
             "sales90": "近90天销量",
             "moh30": "30天MOH",
             "moh90": "90天MOH",
+            "inventory_status": "库存状态",
             "alert_labels": "预警标签",
         }
         widths = {"groupcode": 110, "product_id": 150, "product_name": 220, "alert_labels": 230}
@@ -169,7 +176,7 @@ class InventoryApp:
         form = ttk.Frame(self.settings_tab)
         form.pack(anchor="w")
         config = self.service.config
-        self.growth_var = tk.StringVar(value=str(config.growth_threshold))
+        self.growth_var = tk.StringVar(value=f"{config.growth_threshold:.1%}")
         self.moh30_var = tk.StringVar(value=str(config.moh30_threshold))
         self.moh90_var = tk.StringVar(value=str(config.moh90_threshold))
         self.codes_var = tk.StringVar(value=", ".join(config.beijing_codes))
@@ -266,6 +273,19 @@ class InventoryApp:
             selected_alert = self.alert_filter.get()
             if selected_alert != "全部":
                 frame = frame.loc[frame["alert_labels"].map(lambda labels: selected_alert in labels)]
+            categories = sorted(value for value in frame.get("category", pd.Series(dtype=object)).dropna().unique())
+            self.category_combo["values"] = ["全部", *categories]
+            selected_category = self.category_filter.get()
+            if selected_category != "全部" and "category" in frame:
+                frame = frame.loc[frame["category"] == selected_category]
+            if self.quality_only.get():
+                frame = frame.loc[frame["quality_labels"].map(bool)]
+            severity_order = {"无库存预警": 0, "增长型缺货风险": 1, "常规低库存": 2, "滞销品预警": 3, "数据质量异常": 4}
+            frame = frame.assign(
+                _severity=frame["alert_labels"].map(lambda labels: min((severity_order.get(label, 99) for label in labels), default=99)),
+                _low_moh=frame.apply(lambda row: min((value for value in (row.get("moh30"), row.get("moh90")) if value is not None and not pd.isna(value)), default=float("inf")), axis=1),
+                _growth_sort=frame["growth"].fillna(float("-inf")),
+            ).sort_values(["_severity", "_low_moh", "_growth_sort"], ascending=[True, True, False]).drop(columns=["_severity", "_low_moh", "_growth_sort"])
             self.current_frame = frame
             self.summary_var.set(f"快照日 {snapshot_date}：{len(frame)} 个商品，{sum(bool(labels) for labels in frame['alert_labels'])} 个含预警标签")
             self._fill_dashboard(frame)
@@ -283,6 +303,9 @@ class InventoryApp:
                 value = row.get(column)
                 if column == "growth" and value is not None and not pd.isna(value):
                     value = f"{float(value):.1%}"
+                elif column == "growth":
+                    reasons = {"base_zero": "基数为0", "not_positive": "销量非正", "history_missing": "历史缺失"}
+                    value = f"—（{reasons.get(row.get('growth_status'), '不可计算')}）"
                 elif column == "alert_labels":
                     value = "、".join(value or [])
                 else:
@@ -313,6 +336,8 @@ class InventoryApp:
             figure = Figure(figsize=(12, 3.2), dpi=90)
             axis = figure.add_subplot(111)
             axis.plot(history["snapshot_date"], history["sales"], marker="o", label="销量")
+            axis.plot(history["snapshot_date"], history["stock_total"], marker="o", label="库存总量")
+            axis.plot(history["snapshot_date"], history["in_transit"], marker="o", label="在途库存")
             axis.plot(history["snapshot_date"], history["moh30"], marker="o", label="30天MOH")
             axis.plot(history["snapshot_date"], history["moh90"], marker="o", label="90天MOH")
             axis.set_title(f"{groupcode} / {product_id} 趋势")
@@ -331,9 +356,14 @@ class InventoryApp:
             codes = tuple(code.strip() for code in self.codes_var.get().split(",") if code.strip())
             if not codes:
                 raise ValueError("至少需要一个北京库房代码")
-            config = TrackerConfig(float(self.growth_var.get()), float(self.moh30_var.get()), float(self.moh90_var.get()), codes)
+            growth_raw = self.growth_var.get().strip()
+            growth_value = float(growth_raw.replace("%", ""))
+            if "%" in growth_raw or growth_value > 1:
+                growth_value /= 100
+            config = TrackerConfig(growth_value, float(self.moh30_var.get()), float(self.moh90_var.get()), codes)
             self.config_store.save(config)
             self.service.config = config
+            self._refresh_dashboard()
             messagebox.showinfo("设置已保存", "新设置将用于后续导入和计算")
         except Exception as error:
             messagebox.showerror("设置保存失败", str(error))

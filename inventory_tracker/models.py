@@ -93,4 +93,3 @@ class CommitResult:
     import_id: int
     message: str
     report: QualityReport
-

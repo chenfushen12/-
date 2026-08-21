@@ -28,4 +28,3 @@ class ConfigStore:
     def save(self, config: TrackerConfig) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(asdict(config), ensure_ascii=False, indent=2), encoding="utf-8")
-

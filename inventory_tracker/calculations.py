@@ -129,6 +129,7 @@ def calculate_tracking(
     imported_sales_dates: set[date],
     inventory_complete: bool,
     config: TrackerConfig,
+    negative_sales_keys: set[tuple[str, str]] | None = None,
 ) -> pd.DataFrame:
     """Calculate one inventory snapshot from normalized frames.
 
@@ -143,6 +144,8 @@ def calculate_tracking(
         ("xingwang_available", "in_transit", "source_sales90", "source_sales30"),
     )
     imported_dates = {_date(value) for value in imported_sales_dates}
+    beijing_loaded = beijing_inventory is not None and not beijing_inventory.empty
+    xingwang_loaded = xingwang_inventory is not None and not xingwang_inventory.empty
     rows: list[dict[str, object]] = []
 
     for _, product in products.iterrows():
@@ -195,9 +198,9 @@ def calculate_tracking(
         xingwang_available = _number(xingwang.get("xingwang_available"))
         in_transit = _number(xingwang.get("in_transit"))
         quality_labels: list[str] = []
-        if item_key not in beijing_lookup:
+        if beijing_loaded and item_key not in beijing_lookup:
             quality_labels.append("北京库存未匹配")
-        if item_key not in xingwang_lookup:
+        if xingwang_loaded and item_key not in xingwang_lookup:
             quality_labels.append("星望库存未匹配")
         for value, label in (
             (beijing_available, "北京可用库存"),
@@ -214,6 +217,8 @@ def calculate_tracking(
             quality_labels.append("近90天历史不足")
         if "近30天历史不足" in quality_labels or "近90天历史不足" in quality_labels:
             quality_labels.append("历史不足")
+        if item_key in (negative_sales_keys or set()):
+            quality_labels.append("销售包含负销量")
 
         stock_total: float | None = None
         if inventory_complete and all(value is not None for value in (beijing_available, xingwang_available, in_transit)):
@@ -229,9 +234,9 @@ def calculate_tracking(
             growth=growth,
             inventory_complete=inventory_complete,
             config=config,
-            has_quality_error=any(
-                label.endswith("未匹配") or "负数" in label for label in quality_labels
-            ),
+                has_quality_error=any(
+                    label.endswith("未匹配") or "负数" in label or "负销量" in label for label in quality_labels
+                ),
         )
 
         row = {column: product.get(column) for column in products.columns}

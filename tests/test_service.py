@@ -85,3 +85,44 @@ def test_single_warehouse_commit_persists_partial_snapshot(tmp_path) -> None:
     row = service.get_snapshot(date(2026, 8, 10)).iloc[0]
     assert row["snapshot_status"] == "partial"
     assert row["inventory_status"] == "待补全"
+    assert "北京库存未匹配" not in row["quality_labels"]
+    assert "星望库存未匹配" not in row["quality_labels"]
+
+
+def test_rejected_batch_keeps_raw_files_and_rejected_logs(tmp_path) -> None:
+    template, sales, beijing, xingwang = _write_inputs(tmp_path)
+    broken_sales = tmp_path / "broken-sales.xlsx"
+    pd.DataFrame([{"时间": "not-a-date", "GROUP CODE": "G1", "货品编号": "001", "数量": 1}]).to_excel(broken_sales, index=False)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    previews = (
+        preview_template(template),
+        preview_sales(broken_sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+
+    with pytest.raises(ValueError):
+        service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    assert list((tmp_path / "data" / "raw").rglob("*.xlsx"))
+    assert any(log["status"] == "rejected" for log in service.database.import_logs())
+
+
+def test_future_sales_dates_are_reported_and_excluded(tmp_path) -> None:
+    template, _sales, beijing, xingwang = _write_inputs(tmp_path)
+    future_sales = tmp_path / "future-sales.xlsx"
+    pd.DataFrame(
+        [{"时间": "2026-08-20", "GROUP CODE": "G1", "货品编号": "001", "数量": 10}]
+    ).to_excel(future_sales, index=False)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    previews = (
+        preview_template(template),
+        preview_sales(future_sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+
+    result = service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    assert any(issue.code == "future_sales_date" for issue in result.report.infos)
+    assert result.frame.iloc[0]["sales"] is None

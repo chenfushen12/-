@@ -31,7 +31,7 @@ class OverlapError(ValueError):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass
 class SnapshotResult:
     status: str
     frame: pd.DataFrame
@@ -80,6 +80,34 @@ class InventoryTrackerService:
             if self.database.has_import_hash(preview.file_hash):
                 raise DuplicateImportError(f"文件已导入: {preview.source_path}")
 
+    @staticmethod
+    def _add_future_date_issue(preview: ImportPreview, snapshot_date: date) -> None:
+        future_dates = sorted(value for value in preview.imported_dates if value > snapshot_date)
+        if future_dates:
+            preview.report.add(
+                IssueLevel.INFO,
+                "future_sales_date",
+                f"销售日期晚于库存快照日，已排除计算: {', '.join(value.isoformat() for value in future_dates)}",
+                field="business_date",
+            )
+
+    def _record_rejected_previews(self, previews: tuple[ImportPreview, ...], snapshot_date: date | None) -> None:
+        stored_paths = {preview.kind: self._store_raw(preview, snapshot_date) for preview in previews}
+        with self.database.transaction():
+            for preview in previews:
+                if self.database.has_import_hash(preview.file_hash):
+                    continue
+                self.database.insert_import_log(
+                    kind=preview.kind,
+                    source_path=preview.source_path,
+                    stored_path=stored_paths[preview.kind],
+                    file_hash=preview.file_hash,
+                    business_date=snapshot_date,
+                    mode="precheck",
+                    status="rejected",
+                    report_json=self._report_json(preview.report),
+                )
+
     def _overlap(self, preview: ImportPreview) -> set[date]:
         return set(preview.imported_dates) & self.database.existing_sales_dates()
 
@@ -97,7 +125,12 @@ class InventoryTrackerService:
         if not confirmed:
             raise ConfirmationRequired("必须在预览后确认导入")
         previews = (template_preview, sales_preview, beijing_preview, xingwang_preview)
-        self._validate_previews(previews)
+        self._add_future_date_issue(sales_preview, snapshot_date)
+        try:
+            self._validate_previews(previews)
+        except ValidationError:
+            self._record_rejected_previews(previews, snapshot_date)
+            raise
         overlap = self._overlap(sales_preview)
         if overlap and sales_mode == "append":
             raise OverlapError("销售日期与已存在数据重叠，必须选择按日期替换")
@@ -106,7 +139,7 @@ class InventoryTrackerService:
 
         stored_paths = {preview.kind: self._store_raw(preview, snapshot_date) for preview in previews}
         with self.database.transaction():
-            template_log = self.database.insert_import_log(
+            self.database.insert_import_log(
                 kind="template",
                 source_path=template_preview.source_path,
                 stored_path=stored_paths["template"],
@@ -136,6 +169,7 @@ class InventoryTrackerService:
                 sales_preview.imported_dates,
                 import_id=sales_log,
                 replace=sales_mode == "replace",
+                negative_keys=[(value[0], str(value[1]), str(value[2])) for value in sales_preview.metadata.get("negative_keys", [])],
             )
             beijing_log = self.database.insert_import_log(
                 kind="beijing",
@@ -181,12 +215,21 @@ class InventoryTrackerService:
                 beijing_id=beijing_id,
                 xingwang_id=xingwang_id,
             )
+        combined_report = QualityReport()
+        for preview in previews:
+            combined_report.extend(preview.report)
+        combined_report.extend(calculated.report)
+        calculated.report = combined_report
         return calculated
 
     def commit_template(self, preview: ImportPreview, *, snapshot_date: date | None = None, confirmed: bool) -> CommitResult:
         if not confirmed:
             raise ConfirmationRequired("必须在预览后确认导入")
-        self._validate_previews((preview,))
+        try:
+            self._validate_previews((preview,))
+        except ValidationError:
+            self._record_rejected_previews((preview,), snapshot_date)
+            raise
         if preview.kind != "template":
             raise ValueError("只能提交 template 预览")
         stored_path = self._store_raw(preview, snapshot_date)
@@ -207,7 +250,11 @@ class InventoryTrackerService:
     def commit_sales(self, preview: ImportPreview, *, mode: str, confirmed: bool) -> CommitResult:
         if not confirmed:
             raise ConfirmationRequired("必须在预览后确认导入")
-        self._validate_previews((preview,))
+        try:
+            self._validate_previews((preview,))
+        except ValidationError:
+            self._record_rejected_previews((preview,), None)
+            raise
         overlap = self._overlap(preview)
         if overlap and mode == "append":
             raise OverlapError("销售日期重叠，请选择按日期替换")
@@ -228,6 +275,7 @@ class InventoryTrackerService:
                 preview.imported_dates,
                 import_id=import_id,
                 replace=mode == "replace",
+                negative_keys=[(value[0], str(value[1]), str(value[2])) for value in preview.metadata.get("negative_keys", [])],
             )
         return CommitResult(import_id, "销售数据导入成功", preview.report)
 
@@ -241,7 +289,11 @@ class InventoryTrackerService:
         """Replace one warehouse snapshot and recalculate the current date."""
         if not confirmed:
             raise ConfirmationRequired("必须在预览后确认导入")
-        self._validate_previews((preview,))
+        try:
+            self._validate_previews((preview,))
+        except ValidationError:
+            self._record_rejected_previews((preview,), snapshot_date)
+            raise
         if preview.kind not in {"beijing", "xingwang"}:
             raise ValueError("只能提交 beijing 或 xingwang 库存预览")
         stored_path = self._store_raw(preview, snapshot_date)
@@ -265,15 +317,27 @@ class InventoryTrackerService:
                 codes=self.config.beijing_codes,
                 import_id=import_id,
             )
+            existing_meta = self.database.snapshot_meta(snapshot_date)
             active = self.database.active_template()
-            if active is None:
+            if existing_meta is not None:
+                template_version_id = int(existing_meta["template_version_id"])
+                calculation_config = TrackerConfig(
+                    growth_threshold=float(existing_meta["threshold_growth"]),
+                    moh30_threshold=float(existing_meta["threshold_moh30"]),
+                    moh90_threshold=float(existing_meta["threshold_moh90"]),
+                    beijing_codes=tuple(json.loads(existing_meta["beijing_codes_json"])),
+                )
+            elif active is not None:
+                template_version_id = active[0]
+                calculation_config = self.config
+            else:
                 raise ValidationError("尚未启用商品主模板")
-            template_version_id, _ = active
             result = self._calculate_and_save(
                 snapshot_date,
                 template_version_id=template_version_id,
                 beijing_id=self.database.inventory_snapshot_id("beijing", snapshot_date),
                 xingwang_id=self.database.inventory_snapshot_id("xingwang", snapshot_date),
+                config=calculation_config,
             )
         return result
 
@@ -284,10 +348,12 @@ class InventoryTrackerService:
         template_version_id: int,
         beijing_id: int | None,
         xingwang_id: int | None,
+        config: TrackerConfig | None = None,
     ) -> SnapshotResult:
-        active = self.database.active_template()
-        assert active is not None
-        _, products = active
+        products = self.database.template_by_id(template_version_id)
+        if products.empty:
+            raise ValidationError(f"模板版本不存在: {template_version_id}")
+        calculation_config = config or self.config
         sales = self.database.load_sales()
         beijing = self.database.load_inventory("beijing", snapshot_date)
         xingwang = self.database.load_inventory("xingwang", snapshot_date)
@@ -300,7 +366,8 @@ class InventoryTrackerService:
             snapshot_date=snapshot_date,
             imported_sales_dates=self.database.existing_sales_dates(),
             inventory_complete=inventory_complete,
-            config=self.config,
+            config=calculation_config,
+            negative_sales_keys=self.database.load_negative_sales_keys(),
         )
         status = "complete" if inventory_complete else "partial"
         self.database.save_snapshot(
@@ -310,10 +377,10 @@ class InventoryTrackerService:
             beijing_snapshot_id=beijing_id,
             xingwang_snapshot_id=xingwang_id,
             status=status,
-            threshold_growth=self.config.growth_threshold,
-            threshold_moh30=self.config.moh30_threshold,
-            threshold_moh90=self.config.moh90_threshold,
-            beijing_codes=self.config.beijing_codes,
+            threshold_growth=calculation_config.growth_threshold,
+            threshold_moh30=calculation_config.moh30_threshold,
+            threshold_moh90=calculation_config.moh90_threshold,
+            beijing_codes=calculation_config.beijing_codes,
         )
         report = QualityReport()
         if not inventory_complete:
@@ -327,11 +394,27 @@ class InventoryTrackerService:
     def export_snapshot(self, snapshot_date: date, output_path: str | Path) -> None:
         frame = self.get_snapshot(snapshot_date)
         metadata = self.database.snapshot_meta(snapshot_date) or {"snapshot_date": snapshot_date.isoformat()}
+        logs = self.database.import_logs()
+        report = QualityReport()
+        for log in logs:
+            try:
+                issues = json.loads(str(log.get("report_json", "[]")))
+            except json.JSONDecodeError:
+                issues = []
+            for issue in issues:
+                try:
+                    level = IssueLevel(issue.get("level", IssueLevel.INFO.value))
+                except ValueError:
+                    level = IssueLevel.INFO
+                report.add(level, str(issue.get("code", "import")), str(issue.get("message", "")), row=issue.get("row"), field=issue.get("field"))
+        for _, row in frame.iterrows():
+            for label in row.get("quality_labels", []) or []:
+                report.add(IssueLevel.WARNING, "snapshot_quality", str(label), field=str(row.get("product_id", "")))
         export_workbook(
             output_path,
             tracking=frame,
-            quality_report=QualityReport(),
-            import_logs=self.database.import_logs(),
+            quality_report=report,
+            import_logs=logs,
             metadata=metadata,
         )
 

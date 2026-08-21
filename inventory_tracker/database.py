@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS sales_daily (
     PRIMARY KEY (business_date, groupcode, product_id),
     FOREIGN KEY (import_id) REFERENCES import_logs(id)
 );
+CREATE TABLE IF NOT EXISTS sales_negative_keys (
+    business_date TEXT NOT NULL,
+    groupcode TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    import_id INTEGER NOT NULL,
+    PRIMARY KEY (business_date, groupcode, product_id),
+    FOREIGN KEY (import_id) REFERENCES import_logs(id)
+);
 CREATE TABLE IF NOT EXISTS inventory_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     warehouse TEXT NOT NULL,
@@ -241,15 +249,31 @@ class Database:
         ).fetchall()
         return int(version["id"]), pd.DataFrame.from_records([dict(row) for row in rows])
 
+    def template_by_id(self, version_id: int) -> pd.DataFrame:
+        rows = self.connection.execute(
+            "SELECT category, groupcode, groupname, product_id, product_name, note FROM products WHERE template_version_id = ?",
+            (version_id,),
+        ).fetchall()
+        return pd.DataFrame.from_records([dict(row) for row in rows])
+
     def existing_sales_dates(self) -> set[date]:
         rows = self.connection.execute("SELECT business_date FROM sales_dates").fetchall()
         return {date.fromisoformat(row["business_date"]) for row in rows}
 
-    def insert_sales(self, frame: pd.DataFrame, imported_dates: tuple[date, ...], *, import_id: int, replace: bool) -> None:
+    def insert_sales(
+        self,
+        frame: pd.DataFrame,
+        imported_dates: tuple[date, ...],
+        *,
+        import_id: int,
+        replace: bool,
+        negative_keys: list[tuple[date, str, str]] | None = None,
+    ) -> None:
         dates = tuple(_text_date(value) for value in imported_dates)
         if replace and dates:
             placeholders = ",".join("?" for _ in dates)
             self.connection.execute(f"DELETE FROM sales_daily WHERE business_date IN ({placeholders})", dates)
+            self.connection.execute(f"DELETE FROM sales_negative_keys WHERE business_date IN ({placeholders})", dates)
             self.connection.execute(f"DELETE FROM sales_dates WHERE business_date IN ({placeholders})", dates)
         for business_date in imported_dates:
             self.connection.execute(
@@ -270,6 +294,11 @@ class Database:
                     float(row["quantity"]),
                     import_id,
                 ),
+            )
+        for business_date, groupcode, product_id in negative_keys or []:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO sales_negative_keys (business_date, groupcode, product_id, import_id) VALUES (?, ?, ?, ?)",
+                (_text_date(business_date), groupcode, product_id, import_id),
             )
 
     def inventory_snapshot_id(self, warehouse: str, business_date: date) -> int | None:
@@ -348,6 +377,10 @@ class Database:
         frame = pd.DataFrame.from_records([dict(row) for row in rows])
         frame["business_date"] = frame["business_date"].map(date.fromisoformat)
         return frame
+
+    def load_negative_sales_keys(self) -> set[tuple[str, str]]:
+        rows = self.connection.execute("SELECT DISTINCT groupcode, product_id FROM sales_negative_keys").fetchall()
+        return {(str(row["groupcode"]), str(row["product_id"])) for row in rows}
 
     def load_inventory(self, kind: str, business_date: date) -> pd.DataFrame:
         snapshot_id = self.inventory_snapshot_id(kind, business_date)
@@ -467,7 +500,7 @@ class Database:
     def history_for_product(self, groupcode: str, product_id: str) -> pd.DataFrame:
         rows = self.connection.execute(
             """
-            SELECT snapshot_date, sales, moh30, moh90
+            SELECT snapshot_date, sales, stock_total, in_transit, moh30, moh90
             FROM tracking_results
             WHERE groupcode = ? AND product_id = ?
             ORDER BY snapshot_date

@@ -80,13 +80,28 @@ def _clean_key(value: Any) -> str | None:
     return cleaned or None
 
 
-def _clean_keys(frame: pd.DataFrame, report: QualityReport, *, code: str) -> pd.DataFrame:
+def _clean_keys(
+    frame: pd.DataFrame,
+    report: QualityReport,
+    *,
+    code: str,
+    missing_level: IssueLevel = IssueLevel.WARNING,
+) -> pd.DataFrame:
     result = frame.copy()
     for column in ("groupcode", "product_id"):
+        numeric_values = result[column].map(lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and not pd.isna(value))
+        for index in result.index[numeric_values]:
+            report.add(
+                IssueLevel.BLOCKING,
+                "numeric_key_format",
+                "商品主键以数字读取，可能已经丢失前导零；请将 Excel 列设置为文本后重试",
+                row=int(index) + 2,
+                field=column,
+            )
         result[column] = result[column].map(_clean_key)
     missing = result["groupcode"].isna() | result["product_id"].isna()
     for index in result.index[missing]:
-        report.add(IssueLevel.WARNING, code, "缺少商品主键的行被排除", row=int(index) + 2)
+        report.add(missing_level, code, "缺少商品主键的行被排除", row=int(index) + 2)
     return result.loc[~missing].copy()
 
 
@@ -123,7 +138,9 @@ def preview_template(path: str | Path) -> ImportPreview:
     if frame.empty and not report.blocking:
         report.add(IssueLevel.BLOCKING, "empty_template", "商品主模板没有有效数据")
     if not frame.empty:
-        frame = _clean_keys(frame, report, code="template_missing_key")
+        frame = _clean_keys(frame, report, code="template_missing_key", missing_level=IssueLevel.BLOCKING)
+        if frame.empty:
+            report.add(IssueLevel.BLOCKING, "empty_template", "商品主模板没有有效商品主键")
         for optional in ("category", "groupname", "product_name", "note"):
             if optional not in frame:
                 frame[optional] = None
@@ -160,6 +177,10 @@ def preview_sales(path: str | Path) -> ImportPreview:
     frame = frame.loc[~invalid_dates].copy()
     frame = _clean_keys(frame, report, code="sales_missing_key")
     frame = frame.dropna(subset=["quantity"])
+    negative_keys = {
+        (row["business_date"], str(row["groupcode"]).strip(), str(row["product_id"]).strip())
+        for _, row in frame.loc[frame["quantity"] < 0].iterrows()
+    }
     if not frame.empty:
         negative_count = int((frame["quantity"] < 0).sum())
         if negative_count:
@@ -168,7 +189,15 @@ def preview_sales(path: str | Path) -> ImportPreview:
             frame.groupby(["business_date", "groupcode", "product_id"], as_index=False)["quantity"]
             .sum()
         )
-    return ImportPreview("sales", str(path), file_hash(path), frame, report, imported_dates)
+    return ImportPreview(
+        "sales",
+        str(path),
+        file_hash(path),
+        frame,
+        report,
+        imported_dates,
+        metadata={"negative_keys": [list(key) for key in sorted(negative_keys)]},
+    )
 
 
 def _preview_inventory(
