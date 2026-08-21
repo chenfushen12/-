@@ -244,6 +244,10 @@ def test_delete_snapshots_is_permanent_for_results_but_keeps_shared_data_and_aud
     assert len(service.database.import_logs()) == logs_before
     assert len(service.database.deletion_logs()) == 1
 
+    rebuilt = service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+    assert rebuilt.status == "complete"
+    assert len(service.get_snapshot(date(2026, 8, 10))) == 1
+
 
 def test_batch_delete_missing_date_rolls_back_all_deletions(tmp_path) -> None:
     template, sales, beijing, xingwang = _write_inputs(tmp_path)
