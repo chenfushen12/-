@@ -11,7 +11,7 @@ import pandas as pd
 from .calculations import calculate_tracking, reevaluate_alerts
 from .database import Database
 from .importers import file_hash
-from .models import CommitResult, ImportPreview, IssueLevel, QualityReport, TrackerConfig
+from .models import CommitResult, DeletionResult, ImportPreview, IssueLevel, QualityReport, TrackerConfig
 from .export import export_workbook
 
 
@@ -29,6 +29,12 @@ class DuplicateImportError(ValueError):
 
 class OverlapError(ValueError):
     pass
+
+
+class OverwriteRequired(ValueError):
+    def __init__(self, summary: dict[str, object]):
+        self.summary = summary
+        super().__init__(f"快照日期已存在: {summary.get('snapshot_date')}")
 
 
 @dataclass
@@ -129,10 +135,14 @@ class InventoryTrackerService:
         snapshot_date: date,
         confirmed: bool,
         sales_mode: str = "append",
+        overwrite: bool = False,
     ) -> SnapshotResult:
         if not confirmed:
             raise ConfirmationRequired("必须在预览后确认导入")
         previews = (template_preview, sales_preview, beijing_preview, xingwang_preview)
+        existing_summary = self.database.snapshot_summary(snapshot_date)
+        if existing_summary is not None and not overwrite:
+            raise OverwriteRequired(existing_summary)
         self._add_future_date_issue(sales_preview, snapshot_date)
         existing_template_version = self.database.template_version_by_hash(template_preview.file_hash)
         reuse_template = existing_template_version is not None
@@ -154,6 +164,8 @@ class InventoryTrackerService:
             self._record_rejected_previews(previews, snapshot_date)
             raise
         overlap = self._overlap(sales_preview)
+        if overwrite and overlap and reused_imports["sales"] is None:
+            sales_mode = "replace"
         if overlap and sales_mode == "append" and reused_imports["sales"] is None:
             raise OverlapError("销售日期与已存在数据重叠，必须选择按日期替换")
         if sales_mode not in {"append", "replace"}:
@@ -428,6 +440,24 @@ class InventoryTrackerService:
     def get_snapshot(self, snapshot_date: date, *, reevaluate: bool = False) -> pd.DataFrame:
         frame = self.database.load_snapshot(snapshot_date)
         return reevaluate_alerts(frame, self.config) if reevaluate else frame
+
+    def snapshot_summary(self, snapshot_date: date) -> dict[str, object] | None:
+        return self.database.snapshot_summary(snapshot_date)
+
+    def list_snapshots(self) -> list[dict[str, object]]:
+        return self.database.list_snapshots()
+
+    def deletion_logs(self) -> list[dict[str, object]]:
+        return self.database.deletion_logs()
+
+    def delete_snapshots(self, dates: list[date], *, confirmed: bool) -> DeletionResult:
+        if not confirmed:
+            raise ConfirmationRequired("必须在摘要确认后删除快照")
+        if not dates:
+            return DeletionResult((), ())
+        with self.database.transaction():
+            deleted, skipped = self.database.delete_snapshots(dates)
+        return DeletionResult(deleted, skipped)
 
     def export_snapshot(self, snapshot_date: date, output_path: str | Path) -> None:
         frame = self.get_snapshot(snapshot_date)

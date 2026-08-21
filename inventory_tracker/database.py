@@ -134,6 +134,15 @@ CREATE TABLE IF NOT EXISTS tracking_results (
     snapshot_status TEXT NOT NULL,
     PRIMARY KEY (snapshot_date, groupcode, product_id)
 );
+CREATE TABLE IF NOT EXISTS snapshot_deletion_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date TEXT NOT NULL,
+    previous_status TEXT NOT NULL,
+    product_count INTEGER NOT NULL,
+    had_beijing INTEGER NOT NULL,
+    had_xingwang INTEGER NOT NULL,
+    deleted_at TEXT NOT NULL
+);
 """
 
 
@@ -525,6 +534,83 @@ class Database:
             (_text_date(snapshot_date),),
         ).fetchone()
         return dict(row) if row else None
+
+    def snapshot_summary(self, snapshot_date: date) -> dict[str, object] | None:
+        meta = self.snapshot_meta(snapshot_date)
+        if meta is None:
+            return None
+        count = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM tracking_results WHERE snapshot_date = ?",
+            (_text_date(snapshot_date),),
+        ).fetchone()["count"]
+        beijing_id = self.inventory_snapshot_id("beijing", snapshot_date)
+        xingwang_id = self.inventory_snapshot_id("xingwang", snapshot_date)
+        return {
+            "snapshot_date": snapshot_date,
+            "status": meta["status"],
+            "product_count": int(count),
+            "has_beijing": beijing_id is not None,
+            "has_xingwang": xingwang_id is not None,
+        }
+
+    def list_snapshots(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            "SELECT snapshot_date FROM tracking_meta ORDER BY snapshot_date DESC"
+        ).fetchall()
+        summaries = []
+        for row in rows:
+            summary = self.snapshot_summary(date.fromisoformat(row["snapshot_date"]))
+            if summary is not None:
+                summaries.append(summary)
+        return summaries
+
+    def delete_snapshots(self, dates: list[date]) -> tuple[tuple[date, ...], tuple[date, ...]]:
+        deleted: list[date] = []
+        skipped: list[date] = []
+        for snapshot_date in dates:
+            snapshot_text = _text_date(snapshot_date)
+            meta = self.snapshot_meta(snapshot_date)
+            if meta is None:
+                skipped.append(snapshot_date)
+                continue
+            summary = self.snapshot_summary(snapshot_date)
+            assert summary is not None
+            ids = [
+                int(row["id"])
+                for row in self.connection.execute(
+                    "SELECT id FROM inventory_snapshots WHERE business_date = ?",
+                    (snapshot_text,),
+                ).fetchall()
+            ]
+            self.connection.execute("DELETE FROM tracking_results WHERE snapshot_date = ?", (snapshot_text,))
+            self.connection.execute("DELETE FROM tracking_meta WHERE snapshot_date = ?", (snapshot_text,))
+            for snapshot_id in ids:
+                self.connection.execute("DELETE FROM beijing_inventory WHERE snapshot_id = ?", (snapshot_id,))
+                self.connection.execute("DELETE FROM xingwang_inventory WHERE snapshot_id = ?", (snapshot_id,))
+                self.connection.execute("DELETE FROM inventory_snapshots WHERE id = ?", (snapshot_id,))
+            self.connection.execute(
+                """
+                INSERT INTO snapshot_deletion_logs
+                    (snapshot_date, previous_status, product_count, had_beijing, had_xingwang, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_text,
+                    str(summary["status"]),
+                    int(summary["product_count"]),
+                    int(bool(summary["has_beijing"])),
+                    int(bool(summary["has_xingwang"])),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            deleted.append(snapshot_date)
+        return tuple(deleted), tuple(skipped)
+
+    def deletion_logs(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            "SELECT snapshot_date, previous_status, product_count, had_beijing, had_xingwang, deleted_at FROM snapshot_deletion_logs ORDER BY id DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def history_for_product(self, groupcode: str, product_id: str) -> pd.DataFrame:
         rows = self.connection.execute(

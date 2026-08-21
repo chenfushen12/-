@@ -8,14 +8,19 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
+from tkcalendar import DateEntry
 
 from .config import ConfigStore
 from .importers import preview_beijing, preview_sales, preview_template, preview_xingwang
-from .service import InventoryTrackerService, OverlapError, ValidationError
+from .service import InventoryTrackerService, OverlapError, OverwriteRequired, ValidationError
 
 
-def _parse_date(value: str) -> date:
-    return pd.Timestamp(value.strip()).date()
+def _parse_date(value: object) -> date:
+    if isinstance(value, date):
+        return value
+    if hasattr(value, "get_date"):
+        return value.get_date()
+    return pd.Timestamp(str(value).strip()).date()
 
 
 def _format_number(value: object) -> str:
@@ -51,6 +56,7 @@ class InventoryApp:
             config=self.config_store.load(),
         )
         self.previews = None
+        self._preview_snapshot_date: date | None = None
         self.last_report = None
         self.current_frame = pd.DataFrame()
         self._build_style()
@@ -75,10 +81,13 @@ class InventoryApp:
         self.settings_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.dashboard_tab, text="仪表盘")
         self.notebook.add(self.import_tab, text="导入中心")
+        self.history_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.history_tab, text="历史快照")
         self.notebook.add(self.quality_tab, text="数据质量")
         self.notebook.add(self.settings_tab, text="设置")
         self._build_dashboard()
         self._build_import()
+        self._build_history()
         self._build_quality()
         self._build_settings()
 
@@ -87,8 +96,9 @@ class InventoryApp:
         header.pack(fill="x", pady=(0, 8))
         ttk.Label(header, text="库存跟踪仪表盘", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="快照日").pack(side="left", padx=(28, 4))
-        self.dashboard_date = tk.StringVar(value=(date.today() - timedelta(days=1)).isoformat())
-        ttk.Entry(header, textvariable=self.dashboard_date, width=14).pack(side="left")
+        self.dashboard_date = DateEntry(header, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
+        self.dashboard_date.set_date(date.today() - timedelta(days=1))
+        self.dashboard_date.pack(side="left")
         ttk.Button(header, text="刷新", command=self._refresh_dashboard).pack(side="left", padx=6)
         ttk.Button(header, text="导出当前结果", command=self._export_current).pack(side="left", padx=6)
         self.reevaluate_var = tk.BooleanVar(value=False)
@@ -162,8 +172,11 @@ class InventoryApp:
             ttk.Entry(form, textvariable=variable, width=90).grid(row=row, column=1, sticky="ew", padx=4)
             ttk.Button(form, text="选择文件", command=lambda name=key: self._choose_file(name)).grid(row=row, column=2, padx=4)
         ttk.Label(form, text="库存快照日", width=14).grid(row=4, column=0, sticky="w", pady=5)
-        self.snapshot_date = tk.StringVar(value=(date.today() - timedelta(days=1)).isoformat())
-        ttk.Entry(form, textvariable=self.snapshot_date, width=20).grid(row=4, column=1, sticky="w", padx=4)
+        self.snapshot_date = DateEntry(form, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=14)
+        self.snapshot_date.set_date(date.today() - timedelta(days=1))
+        self.snapshot_date.grid(row=4, column=1, sticky="w", padx=4)
+        self.snapshot_date.bind("<<DateEntrySelected>>", self._invalidate_preview_for_date)
+        self.snapshot_date.bind("<FocusOut>", self._invalidate_preview_for_date)
         form.columnconfigure(1, weight=1)
         options = ttk.Frame(self.import_tab)
         options.pack(fill="x", pady=10)
@@ -181,6 +194,114 @@ class InventoryApp:
         ttk.Label(self.import_tab, textvariable=self.import_status, foreground="#375a7f").pack(anchor="w", pady=8)
         self.preview_text = tk.Text(self.import_tab, height=22, wrap="word")
         self.preview_text.pack(fill="both", expand=True)
+
+    def _build_history(self) -> None:
+        ttk.Label(self.history_tab, text="历史快照", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
+        controls = ttk.Frame(self.history_tab)
+        controls.pack(fill="x", pady=(0, 8))
+        ttk.Label(controls, text="定位日期").pack(side="left")
+        self.history_date = DateEntry(controls, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=14)
+        self.history_date.set_date(date.today() - timedelta(days=1))
+        self.history_date.pack(side="left", padx=5)
+        ttk.Button(controls, text="定位", command=self._select_history_date).pack(side="left")
+        ttk.Button(controls, text="刷新", command=self._refresh_history).pack(side="left", padx=5)
+        self.partial_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="只看 partial", variable=self.partial_only, command=self._refresh_history).pack(side="left", padx=10)
+        ttk.Button(controls, text="删除所选日期快照", command=self._delete_selected_snapshots).pack(side="left", padx=10)
+        self.history_progress = ttk.Progressbar(controls, orient="horizontal", mode="indeterminate", length=180)
+        self.history_progress.pack(side="left", padx=5)
+        self.history_status = tk.StringVar(value="")
+        ttk.Label(controls, textvariable=self.history_status).pack(side="left")
+
+        table_frame = ttk.Frame(self.history_tab)
+        table_frame.pack(fill="both", expand=True)
+        columns = ("snapshot_date", "status", "product_count", "has_beijing", "has_xingwang")
+        self.history_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
+        for column, heading, width in (
+            ("snapshot_date", "快照日期", 150),
+            ("status", "状态", 100),
+            ("product_count", "商品数", 100),
+            ("has_beijing", "北京库存", 120),
+            ("has_xingwang", "星望库存", 120),
+        ):
+            self.history_tree.heading(column, text=heading)
+            self.history_tree.column(column, width=width, anchor="w")
+        history_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=history_scroll.set)
+        self.history_tree.pack(side="left", fill="both", expand=True)
+        history_scroll.pack(side="right", fill="y")
+
+        ttk.Label(self.history_tab, text="删除记录", style="Title.TLabel").pack(anchor="w", pady=(10, 5))
+        self.deletion_log_text = tk.Text(self.history_tab, height=7, wrap="word")
+        self.deletion_log_text.pack(fill="x")
+        self._refresh_history()
+
+    def _refresh_history(self) -> None:
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        snapshots = self.service.list_snapshots()
+        if self.partial_only.get():
+            snapshots = [item for item in snapshots if item["status"] == "partial"]
+        for item in snapshots:
+            self.history_tree.insert(
+                "",
+                "end",
+                values=(
+                    item["snapshot_date"].strftime("%Y/%m/%d"),
+                    item["status"],
+                    item["product_count"],
+                    "已存在" if item["has_beijing"] else "缺失",
+                    "已存在" if item["has_xingwang"] else "缺失",
+                ),
+            )
+        logs = self.service.deletion_logs()
+        self.deletion_log_text.delete("1.0", "end")
+        if logs:
+            for log in logs:
+                self.deletion_log_text.insert(
+                    "end",
+                    f"{log['snapshot_date']} | {log['deleted_at']} | {log['previous_status']} | 商品 {log['product_count']}\n",
+                )
+        else:
+            self.deletion_log_text.insert("end", "暂无删除记录")
+
+    def _select_history_date(self) -> None:
+        target = _parse_date(self.history_date)
+        for item in self.history_tree.get_children():
+            values = self.history_tree.item(item, "values")
+            if values and values[0] == target.strftime("%Y/%m/%d"):
+                self.history_tree.selection_set(item)
+                self.history_tree.focus(item)
+                self.history_tree.see(item)
+                return
+        messagebox.showinfo("没有快照", "该日期没有库存快照")
+
+    def _delete_selected_snapshots(self) -> None:
+        selected = self.history_tree.selection()
+        if not selected:
+            messagebox.showwarning("未选择日期", "请先选择一个或多个历史快照日期")
+            return
+        dates = [_parse_date(self.history_tree.item(item, "values")[0]) for item in selected]
+        summaries = [self.service.snapshot_summary(value) for value in dates]
+        details = "\n".join(
+            f"{summary['snapshot_date'].strftime('%Y/%m/%d')} | {summary['status']} | 商品 {summary['product_count']} | 北京 {'有' if summary['has_beijing'] else '无'} | 星望 {'有' if summary['has_xingwang'] else '无'}"
+            for summary in summaries
+            if summary is not None
+        )
+        if not messagebox.askyesno("删除该日期快照", f"以下快照将被永久删除：\n\n{details}\n\n销售数据、原始 Excel 和导入日志不会删除。", default="no"):
+            return
+        self.history_progress.start(12)
+        self.history_status.set("正在删除…")
+
+        def worker() -> None:
+            try:
+                result = self.service.delete_snapshots(dates, confirmed=True)
+            except Exception as error:
+                self.root.after(0, lambda error=error: (self.history_progress.stop(), self.history_status.set("删除失败"), messagebox.showerror("删除失败", str(error))))
+            else:
+                self.root.after(0, lambda result=result: (self.history_progress.stop(), self.history_status.set(f"已删除 {len(result.deleted_dates)} 个快照"), self._refresh_history(), self._refresh_dashboard()))
+
+        threading.Thread(target=worker, name="snapshot-delete", daemon=True).start()
 
     def _build_quality(self) -> None:
         ttk.Label(self.quality_tab, text="数据质量报告", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
@@ -205,6 +326,18 @@ class InventoryApp:
         path = filedialog.askopenfilename(filetypes=[("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")])
         if path:
             self.file_vars[key].set(path)
+
+    def _invalidate_preview_for_date(self, _event=None) -> None:
+        if self._preview_snapshot_date is None:
+            return
+        try:
+            current_date = _parse_date(self.snapshot_date)
+        except Exception:
+            current_date = None
+        if current_date != self._preview_snapshot_date:
+            self.previews = None
+            self._preview_snapshot_date = None
+            self.import_status.set("库存日期已改变，请重新预检查")
 
     def _set_import_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
@@ -238,6 +371,8 @@ class InventoryApp:
     def _show_background_error(error: Exception) -> None:
         if isinstance(error, OverlapError):
             messagebox.showwarning("销售日期重叠", str(error) + "；勾选替换选项后重试")
+        elif isinstance(error, OverwriteRequired):
+            messagebox.showwarning("快照已存在", "目标日期已有快照，请重新点击确认导入并确认覆盖")
         else:
             messagebox.showerror("导入失败", str(error))
 
@@ -266,7 +401,13 @@ class InventoryApp:
 
     def _apply_preview_result(self, result) -> None:
         snapshot_date, previews = result
+        if _parse_date(self.snapshot_date) != snapshot_date:
+            self.import_status.set("预检查完成时库存日期已改变，请重新预检查")
+            self.previews = None
+            self._preview_snapshot_date = None
+            return
         self.previews = previews
+        self._preview_snapshot_date = snapshot_date
         self.last_report = report = self._combine_reports(previews)
         self._show_report(report)
         lines = []
@@ -290,15 +431,34 @@ class InventoryApp:
         if not self.previews:
             messagebox.showwarning("尚未预检查", "请先执行预检查并预览")
             return
+        if self._preview_snapshot_date != _parse_date(self.snapshot_date):
+            self.previews = None
+            self._preview_snapshot_date = None
+            messagebox.showwarning("预览已失效", "库存日期已改变，请重新执行预检查")
+            return
         report = self.last_report
         if report.blocking:
             messagebox.showerror("无法提交", "存在阻断问题，请先修复输入文件")
             return
-        if not messagebox.askyesno("确认导入", "确认写入四类数据并生成库存快照吗？"):
-            return
         try:
             snapshot_date = _parse_date(self.snapshot_date.get())
             sales_mode = "replace" if self.replace_sales.get() else "append"
+            overwrite = False
+            existing = self.service.snapshot_summary(snapshot_date)
+            if existing is not None:
+                summary = (
+                    f"目标日期：{snapshot_date.strftime('%Y/%m/%d')}\n"
+                    f"当前状态：{existing['status']}\n"
+                    f"商品数：{existing['product_count']}\n"
+                    f"北京库存：{'已存在' if existing['has_beijing'] else '缺失'}\n"
+                    f"星望库存：{'已存在' if existing['has_xingwang'] else '缺失'}\n\n"
+                    "覆盖后将替换当前日期结果和两仓库存快照；销售数据只替换新文件中实际重叠的日期。"
+                )
+                if not messagebox.askyesno("覆盖已有快照", summary, default="no"):
+                    return
+                overwrite = True
+            elif not messagebox.askyesno("确认导入", "确认写入四类数据并生成库存快照吗？"):
+                return
 
             def work(progress):
                 progress(10, "校验并保存原始文件…")
@@ -307,6 +467,7 @@ class InventoryApp:
                     snapshot_date=snapshot_date,
                     confirmed=True,
                     sales_mode=sales_mode,
+                    overwrite=overwrite,
                 )
                 progress(100, "快照计算完成")
                 return result

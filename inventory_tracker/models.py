@@ -93,3 +93,9 @@ class CommitResult:
     import_id: int
     message: str
     report: QualityReport
+
+
+@dataclass(frozen=True)
+class DeletionResult:
+    deleted_dates: tuple[date, ...]
+    skipped_dates: tuple[date, ...]
