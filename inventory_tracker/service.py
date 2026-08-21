@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+import json
+import shutil
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+
+from .calculations import calculate_tracking, reevaluate_alerts
+from .database import Database
+from .importers import file_hash
+from .models import CommitResult, ImportPreview, IssueLevel, QualityReport, TrackerConfig
+from .export import export_workbook
+
+
+class ConfirmationRequired(ValueError):
+    pass
+
+
+class ValidationError(ValueError):
+    pass
+
+
+class DuplicateImportError(ValueError):
+    pass
+
+
+class OverlapError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class SnapshotResult:
+    status: str
+    frame: pd.DataFrame
+    report: QualityReport
+
+
+class InventoryTrackerService:
+    def __init__(self, database_path: str | Path, *, data_dir: str | Path | None = None, config: TrackerConfig | None = None):
+        self.database = Database(database_path)
+        self.data_dir = Path(data_dir) if data_dir else Path(database_path).parent / "data"
+        self.config = config or TrackerConfig()
+
+    def close(self) -> None:
+        self.database.close()
+
+    def _store_raw(self, preview: ImportPreview, snapshot_date: date | None) -> str:
+        date_part = snapshot_date.isoformat() if snapshot_date else "undated"
+        target_dir = self.data_dir / "raw" / preview.kind / date_part
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{preview.file_hash}.xlsx"
+        if not target.exists():
+            shutil.copy2(preview.source_path, target)
+        return str(target)
+
+    @staticmethod
+    def _report_json(report: QualityReport) -> str:
+        return json.dumps(
+            [
+                {
+                    "level": issue.level.value,
+                    "code": issue.code,
+                    "message": issue.message,
+                    "row": issue.row,
+                    "field": issue.field,
+                }
+                for issue in report.issues
+            ],
+            ensure_ascii=False,
+        )
+
+    def _validate_previews(self, previews: tuple[ImportPreview, ...]) -> None:
+        blocking = [issue for preview in previews for issue in preview.report.blocking]
+        if blocking:
+            raise ValidationError("导入包含阻断问题: " + "；".join(issue.message for issue in blocking[:5]))
+        for preview in previews:
+            if self.database.has_import_hash(preview.file_hash):
+                raise DuplicateImportError(f"文件已导入: {preview.source_path}")
+
+    def _overlap(self, preview: ImportPreview) -> set[date]:
+        return set(preview.imported_dates) & self.database.existing_sales_dates()
+
+    def commit_batch(
+        self,
+        template_preview: ImportPreview,
+        sales_preview: ImportPreview,
+        beijing_preview: ImportPreview,
+        xingwang_preview: ImportPreview,
+        *,
+        snapshot_date: date,
+        confirmed: bool,
+        sales_mode: str = "append",
+    ) -> SnapshotResult:
+        if not confirmed:
+            raise ConfirmationRequired("必须在预览后确认导入")
+        previews = (template_preview, sales_preview, beijing_preview, xingwang_preview)
+        self._validate_previews(previews)
+        overlap = self._overlap(sales_preview)
+        if overlap and sales_mode == "append":
+            raise OverlapError("销售日期与已存在数据重叠，必须选择按日期替换")
+        if sales_mode not in {"append", "replace"}:
+            raise ValueError("sales_mode 必须为 append 或 replace")
+
+        stored_paths = {preview.kind: self._store_raw(preview, snapshot_date) for preview in previews}
+        with self.database.transaction():
+            template_log = self.database.insert_import_log(
+                kind="template",
+                source_path=template_preview.source_path,
+                stored_path=stored_paths["template"],
+                file_hash=template_preview.file_hash,
+                business_date=snapshot_date,
+                mode="activate",
+                status="committed",
+                report_json=self._report_json(template_preview.report),
+            )
+            template_version_id = self.database.insert_template(
+                template_preview.frame,
+                source_hash=template_preview.file_hash,
+                stored_path=stored_paths["template"],
+            )
+            sales_log = self.database.insert_import_log(
+                kind="sales",
+                source_path=sales_preview.source_path,
+                stored_path=stored_paths["sales"],
+                file_hash=sales_preview.file_hash,
+                business_date=snapshot_date,
+                mode=sales_mode,
+                status="committed",
+                report_json=self._report_json(sales_preview.report),
+            )
+            self.database.insert_sales(
+                sales_preview.frame,
+                sales_preview.imported_dates,
+                import_id=sales_log,
+                replace=sales_mode == "replace",
+            )
+            beijing_log = self.database.insert_import_log(
+                kind="beijing",
+                source_path=beijing_preview.source_path,
+                stored_path=stored_paths["beijing"],
+                file_hash=beijing_preview.file_hash,
+                business_date=snapshot_date,
+                mode="replace",
+                status="committed",
+                report_json=self._report_json(beijing_preview.report),
+            )
+            beijing_id = self.database.upsert_inventory(
+                "beijing",
+                snapshot_date,
+                beijing_preview.frame,
+                source_hash=beijing_preview.file_hash,
+                stored_path=stored_paths["beijing"],
+                codes=self.config.beijing_codes,
+                import_id=beijing_log,
+            )
+            xingwang_log = self.database.insert_import_log(
+                kind="xingwang",
+                source_path=xingwang_preview.source_path,
+                stored_path=stored_paths["xingwang"],
+                file_hash=xingwang_preview.file_hash,
+                business_date=snapshot_date,
+                mode="replace",
+                status="committed",
+                report_json=self._report_json(xingwang_preview.report),
+            )
+            xingwang_id = self.database.upsert_inventory(
+                "xingwang",
+                snapshot_date,
+                xingwang_preview.frame,
+                source_hash=xingwang_preview.file_hash,
+                stored_path=stored_paths["xingwang"],
+                codes=self.config.beijing_codes,
+                import_id=xingwang_log,
+            )
+            calculated = self._calculate_and_save(
+                snapshot_date,
+                template_version_id=template_version_id,
+                beijing_id=beijing_id,
+                xingwang_id=xingwang_id,
+            )
+        return calculated
+
+    def commit_template(self, preview: ImportPreview, *, snapshot_date: date | None = None, confirmed: bool) -> CommitResult:
+        if not confirmed:
+            raise ConfirmationRequired("必须在预览后确认导入")
+        self._validate_previews((preview,))
+        if preview.kind != "template":
+            raise ValueError("只能提交 template 预览")
+        stored_path = self._store_raw(preview, snapshot_date)
+        with self.database.transaction():
+            import_id = self.database.insert_import_log(
+                kind="template",
+                source_path=preview.source_path,
+                stored_path=stored_path,
+                file_hash=preview.file_hash,
+                business_date=snapshot_date,
+                mode="activate",
+                status="committed",
+                report_json=self._report_json(preview.report),
+            )
+            self.database.insert_template(preview.frame, source_hash=preview.file_hash, stored_path=stored_path)
+        return CommitResult(import_id, "商品模板已启用", preview.report)
+
+    def commit_sales(self, preview: ImportPreview, *, mode: str, confirmed: bool) -> CommitResult:
+        if not confirmed:
+            raise ConfirmationRequired("必须在预览后确认导入")
+        self._validate_previews((preview,))
+        overlap = self._overlap(preview)
+        if overlap and mode == "append":
+            raise OverlapError("销售日期重叠，请选择按日期替换")
+        stored_path = self._store_raw(preview, None)
+        with self.database.transaction():
+            import_id = self.database.insert_import_log(
+                kind=preview.kind,
+                source_path=preview.source_path,
+                stored_path=stored_path,
+                file_hash=preview.file_hash,
+                business_date=None,
+                mode=mode,
+                status="committed",
+                report_json=self._report_json(preview.report),
+            )
+            self.database.insert_sales(
+                preview.frame,
+                preview.imported_dates,
+                import_id=import_id,
+                replace=mode == "replace",
+            )
+        return CommitResult(import_id, "销售数据导入成功", preview.report)
+
+    def commit_inventory(
+        self,
+        preview: ImportPreview,
+        *,
+        snapshot_date: date,
+        confirmed: bool,
+    ) -> SnapshotResult:
+        """Replace one warehouse snapshot and recalculate the current date."""
+        if not confirmed:
+            raise ConfirmationRequired("必须在预览后确认导入")
+        self._validate_previews((preview,))
+        if preview.kind not in {"beijing", "xingwang"}:
+            raise ValueError("只能提交 beijing 或 xingwang 库存预览")
+        stored_path = self._store_raw(preview, snapshot_date)
+        with self.database.transaction():
+            import_id = self.database.insert_import_log(
+                kind=preview.kind,
+                source_path=preview.source_path,
+                stored_path=stored_path,
+                file_hash=preview.file_hash,
+                business_date=snapshot_date,
+                mode="replace",
+                status="committed",
+                report_json=self._report_json(preview.report),
+            )
+            snapshot_id = self.database.upsert_inventory(
+                preview.kind,
+                snapshot_date,
+                preview.frame,
+                source_hash=preview.file_hash,
+                stored_path=stored_path,
+                codes=self.config.beijing_codes,
+                import_id=import_id,
+            )
+            active = self.database.active_template()
+            if active is None:
+                raise ValidationError("尚未启用商品主模板")
+            template_version_id, _ = active
+            result = self._calculate_and_save(
+                snapshot_date,
+                template_version_id=template_version_id,
+                beijing_id=self.database.inventory_snapshot_id("beijing", snapshot_date),
+                xingwang_id=self.database.inventory_snapshot_id("xingwang", snapshot_date),
+            )
+        return result
+
+    def _calculate_and_save(
+        self,
+        snapshot_date: date,
+        *,
+        template_version_id: int,
+        beijing_id: int | None,
+        xingwang_id: int | None,
+    ) -> SnapshotResult:
+        active = self.database.active_template()
+        assert active is not None
+        _, products = active
+        sales = self.database.load_sales()
+        beijing = self.database.load_inventory("beijing", snapshot_date)
+        xingwang = self.database.load_inventory("xingwang", snapshot_date)
+        inventory_complete = beijing_id is not None and xingwang_id is not None
+        result = calculate_tracking(
+            products,
+            sales,
+            beijing,
+            xingwang,
+            snapshot_date=snapshot_date,
+            imported_sales_dates=self.database.existing_sales_dates(),
+            inventory_complete=inventory_complete,
+            config=self.config,
+        )
+        status = "complete" if inventory_complete else "partial"
+        self.database.save_snapshot(
+            snapshot_date,
+            result,
+            template_version_id=template_version_id,
+            beijing_snapshot_id=beijing_id,
+            xingwang_snapshot_id=xingwang_id,
+            status=status,
+            threshold_growth=self.config.growth_threshold,
+            threshold_moh30=self.config.moh30_threshold,
+            threshold_moh90=self.config.moh90_threshold,
+            beijing_codes=self.config.beijing_codes,
+        )
+        report = QualityReport()
+        if not inventory_complete:
+            report.add(IssueLevel.INFO, "partial_inventory", "库存快照缺少一个仓库")
+        return SnapshotResult(status, result, report)
+
+    def get_snapshot(self, snapshot_date: date, *, reevaluate: bool = False) -> pd.DataFrame:
+        frame = self.database.load_snapshot(snapshot_date)
+        return reevaluate_alerts(frame, self.config) if reevaluate else frame
+
+    def export_snapshot(self, snapshot_date: date, output_path: str | Path) -> None:
+        frame = self.get_snapshot(snapshot_date)
+        metadata = self.database.snapshot_meta(snapshot_date) or {"snapshot_date": snapshot_date.isoformat()}
+        export_workbook(
+            output_path,
+            tracking=frame,
+            quality_report=QualityReport(),
+            import_logs=self.database.import_logs(),
+            metadata=metadata,
+        )
+
+    def history_for_product(self, groupcode: str, product_id: str) -> pd.DataFrame:
+        return self.database.history_for_product(groupcode, product_id)
