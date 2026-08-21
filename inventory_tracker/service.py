@@ -37,6 +37,10 @@ class OverwriteRequired(ValueError):
         super().__init__(f"快照日期已存在: {summary.get('snapshot_date')}")
 
 
+class SnapshotNotFound(ValueError):
+    pass
+
+
 @dataclass
 class SnapshotResult:
     status: str
@@ -455,6 +459,10 @@ class InventoryTrackerService:
             raise ConfirmationRequired("必须在摘要确认后删除快照")
         if not dates:
             return DeletionResult((), ())
+        missing = [value for value in dates if self.database.snapshot_summary(value) is None]
+        if missing:
+            formatted = ", ".join(value.strftime("%Y/%m/%d") for value in missing)
+            raise SnapshotNotFound(f"以下日期没有可删除的快照: {formatted}")
         with self.database.transaction():
             deleted, skipped = self.database.delete_snapshots(dates)
         return DeletionResult(deleted, skipped)

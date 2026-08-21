@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from inventory_tracker.importers import preview_beijing, preview_sales, preview_template, preview_xingwang
-from inventory_tracker.service import InventoryTrackerService, OverlapError, ConfirmationRequired, OverwriteRequired
+from inventory_tracker.service import InventoryTrackerService, OverlapError, ConfirmationRequired, OverwriteRequired, SnapshotNotFound
 
 
 def _write_inputs(tmp_path):
@@ -243,3 +243,21 @@ def test_delete_snapshots_is_permanent_for_results_but_keeps_shared_data_and_aud
     assert service.database.existing_sales_dates() == {date(2026, 8, 10)}
     assert len(service.database.import_logs()) == logs_before
     assert len(service.database.deletion_logs()) == 1
+
+
+def test_batch_delete_missing_date_rolls_back_all_deletions(tmp_path) -> None:
+    template, sales, beijing, xingwang = _write_inputs(tmp_path)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    previews = (
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+    service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    with pytest.raises(SnapshotNotFound):
+        service.delete_snapshots([date(2026, 8, 10), date(2026, 8, 12)], confirmed=True)
+
+    assert len(service.get_snapshot(date(2026, 8, 10))) == 1
+    assert service.database.deletion_logs() == []

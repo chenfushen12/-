@@ -72,6 +72,27 @@ class InventoryApp:
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 18, "bold"), foreground="#16324f")
         style.configure("Danger.Treeview", foreground="#9b1c1c")
 
+    def _confirm_action(self, title: str, message: str, confirm_text: str) -> bool:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        ttk.Label(dialog, text=message, justify="left", wraplength=620).pack(padx=20, pady=18)
+        buttons = ttk.Frame(dialog)
+        buttons.pack(pady=(0, 16))
+        result = {"confirmed": False}
+
+        def close(value: bool) -> None:
+            result["confirmed"] = value
+            dialog.destroy()
+
+        ttk.Button(buttons, text="取消", command=lambda: close(False)).pack(side="left", padx=6)
+        ttk.Button(buttons, text=confirm_text, command=lambda: close(True)).pack(side="left", padx=6)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        self.root.wait_window(dialog)
+        return result["confirmed"]
+
     def _build_tabs(self) -> None:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=12)
@@ -207,7 +228,8 @@ class InventoryApp:
         ttk.Button(controls, text="刷新", command=self._refresh_history).pack(side="left", padx=5)
         self.partial_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(controls, text="只看 partial", variable=self.partial_only, command=self._refresh_history).pack(side="left", padx=10)
-        ttk.Button(controls, text="删除所选日期快照", command=self._delete_selected_snapshots).pack(side="left", padx=10)
+        self.delete_history_button = ttk.Button(controls, text="删除所选日期快照", command=self._delete_selected_snapshots, state="disabled")
+        self.delete_history_button.pack(side="left", padx=10)
         self.history_progress = ttk.Progressbar(controls, orient="horizontal", mode="indeterminate", length=180)
         self.history_progress.pack(side="left", padx=5)
         self.history_status = tk.StringVar(value="")
@@ -230,6 +252,7 @@ class InventoryApp:
         self.history_tree.configure(yscrollcommand=history_scroll.set)
         self.history_tree.pack(side="left", fill="both", expand=True)
         history_scroll.pack(side="right", fill="y")
+        self.history_tree.bind("<<TreeviewSelect>>", self._update_history_delete_state)
 
         ttk.Label(self.history_tab, text="删除记录", style="Title.TLabel").pack(anchor="w", pady=(10, 5))
         self.deletion_log_text = tk.Text(self.history_tab, height=7, wrap="word")
@@ -264,6 +287,12 @@ class InventoryApp:
                 )
         else:
             self.deletion_log_text.insert("end", "暂无删除记录")
+        self._update_history_delete_state()
+
+    def _update_history_delete_state(self, _event=None) -> None:
+        if hasattr(self, "delete_history_button"):
+            state = "normal" if self.history_tree.selection() else "disabled"
+            self.delete_history_button.configure(state=state)
 
     def _select_history_date(self) -> None:
         target = _parse_date(self.history_date)
@@ -288,7 +317,9 @@ class InventoryApp:
             for summary in summaries
             if summary is not None
         )
-        if not messagebox.askyesno("删除该日期快照", f"以下快照将被永久删除：\n\n{details}\n\n销售数据、原始 Excel 和导入日志不会删除。", default="no"):
+        title = "删除该日期快照" if len(dates) == 1 else "删除所选日期快照"
+        confirm_text = "删除该日期快照" if len(dates) == 1 else "删除所选日期快照"
+        if not self._confirm_action(title, f"以下快照将被永久删除：\n\n{details}\n\n销售数据、原始 Excel 和导入日志不会删除。", confirm_text):
             return
         self.history_progress.start(12)
         self.history_status.set("正在删除…")
@@ -454,10 +485,10 @@ class InventoryApp:
                     f"星望库存：{'已存在' if existing['has_xingwang'] else '缺失'}\n\n"
                     "覆盖后将替换当前日期结果和两仓库存快照；销售数据只替换新文件中实际重叠的日期。"
                 )
-                if not messagebox.askyesno("覆盖已有快照", summary, default="no"):
+                if not self._confirm_action("覆盖已有快照", summary, "覆盖已有快照"):
                     return
                 overwrite = True
-            elif not messagebox.askyesno("确认导入", "确认写入四类数据并生成库存快照吗？"):
+            elif not self._confirm_action("确认导入", "确认写入四类数据并生成库存快照吗？", "确认导入并计算"):
                 return
 
             def work(progress):
