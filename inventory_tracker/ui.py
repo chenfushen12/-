@@ -319,7 +319,9 @@ class InventoryApp:
             messagebox.showerror("提交失败", str(error))
 
     def _apply_commit_result(self, result) -> None:
-        self.import_status.set(f"导入成功：{result.status}，已生成 {len(result.frame)} 个商品结果")
+        reused_count = sum(issue.code == "reused_file" for issue in result.report.infos)
+        reused_text = f"，复用 {reused_count} 个已导入文件" if reused_count else ""
+        self.import_status.set(f"导入成功：{result.status}，已生成 {len(result.frame)} 个商品结果{reused_text}")
         self._show_report(result.report)
         self._refresh_dashboard()
         self.notebook.select(self.dashboard_tab)

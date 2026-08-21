@@ -157,3 +157,28 @@ def test_same_active_template_can_be_reused_for_another_snapshot_date(tmp_path) 
     assert result.status == "complete"
     assert len(service.get_snapshot(date(2026, 8, 10))) == 1
     assert len(service.get_snapshot(date(2026, 8, 11))) == 1
+
+
+def test_all_committed_files_can_be_reused_for_a_new_snapshot_date(tmp_path) -> None:
+    template, sales, beijing, xingwang = _write_inputs(tmp_path)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    previews = (
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+    service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    reused = (
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+    result = service.commit_batch(*reused, snapshot_date=date(2026, 8, 11), confirmed=True)
+
+    assert result.status == "complete"
+    assert len(service.get_snapshot(date(2026, 8, 11))) == 1
+    assert service.get_snapshot(date(2026, 8, 11)).iloc[0]["stock_total"] == 35
+    assert sum(issue.code == "reused_file" for issue in result.report.infos) == 4

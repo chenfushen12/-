@@ -114,6 +114,11 @@ class InventoryTrackerService:
     def _overlap(self, preview: ImportPreview) -> set[date]:
         return set(preview.imported_dates) & self.database.existing_sales_dates()
 
+    @staticmethod
+    def _mark_reused(preview: ImportPreview) -> None:
+        if not any(issue.code == "reused_file" for issue in preview.report.issues):
+            preview.report.add(IssueLevel.INFO, "reused_file", f"已复用此前成功导入的 {preview.kind} 文件")
+
     def commit_batch(
         self,
         template_preview: ImportPreview,
@@ -131,18 +136,37 @@ class InventoryTrackerService:
         self._add_future_date_issue(sales_preview, snapshot_date)
         existing_template_version = self.database.template_version_by_hash(template_preview.file_hash)
         reuse_template = existing_template_version is not None
+        reused_imports = {
+            preview.kind: self.database.committed_import_by_hash(preview.kind, preview.file_hash)
+            for preview in previews
+        }
+        reused_hashes = {
+            preview.file_hash
+            for preview in previews
+            if reused_imports[preview.kind] is not None or (preview.kind == "template" and reuse_template)
+        }
+        for preview in previews:
+            if preview.file_hash in reused_hashes:
+                self._mark_reused(preview)
         try:
-            self._validate_previews(previews, ignored_hashes={template_preview.file_hash} if reuse_template else set())
+            self._validate_previews(previews, ignored_hashes=reused_hashes)
         except ValidationError:
             self._record_rejected_previews(previews, snapshot_date)
             raise
         overlap = self._overlap(sales_preview)
-        if overlap and sales_mode == "append":
+        if overlap and sales_mode == "append" and reused_imports["sales"] is None:
             raise OverlapError("销售日期与已存在数据重叠，必须选择按日期替换")
         if sales_mode not in {"append", "replace"}:
             raise ValueError("sales_mode 必须为 append 或 replace")
 
-        stored_paths = {preview.kind: self._store_raw(preview, snapshot_date) for preview in previews}
+        stored_paths = {
+            preview.kind: (
+                str(reused_imports[preview.kind]["stored_path"])
+                if reused_imports[preview.kind] is not None
+                else self._store_raw(preview, snapshot_date)
+            )
+            for preview in previews
+        }
         with self.database.transaction():
             if reuse_template:
                 assert existing_template_version is not None
@@ -164,24 +188,27 @@ class InventoryTrackerService:
                     source_hash=template_preview.file_hash,
                     stored_path=stored_paths["template"],
                 )
-            sales_log = self.database.insert_import_log(
-                kind="sales",
-                source_path=sales_preview.source_path,
-                stored_path=stored_paths["sales"],
-                file_hash=sales_preview.file_hash,
-                business_date=snapshot_date,
-                mode=sales_mode,
-                status="committed",
-                report_json=self._report_json(sales_preview.report),
-            )
-            self.database.insert_sales(
-                sales_preview.frame,
-                sales_preview.imported_dates,
-                import_id=sales_log,
-                replace=sales_mode == "replace",
-                negative_keys=[(value[0], str(value[1]), str(value[2])) for value in sales_preview.metadata.get("negative_keys", [])],
-            )
-            beijing_log = self.database.insert_import_log(
+            sales_reuse = reused_imports["sales"]
+            if sales_reuse is None:
+                sales_log = self.database.insert_import_log(
+                    kind="sales",
+                    source_path=sales_preview.source_path,
+                    stored_path=stored_paths["sales"],
+                    file_hash=sales_preview.file_hash,
+                    business_date=snapshot_date,
+                    mode=sales_mode,
+                    status="committed",
+                    report_json=self._report_json(sales_preview.report),
+                )
+                self.database.insert_sales(
+                    sales_preview.frame,
+                    sales_preview.imported_dates,
+                    import_id=sales_log,
+                    replace=sales_mode == "replace",
+                    negative_keys=[(value[0], str(value[1]), str(value[2])) for value in sales_preview.metadata.get("negative_keys", [])],
+                )
+            beijing_reuse = reused_imports["beijing"]
+            beijing_log = int(beijing_reuse["id"]) if beijing_reuse is not None else self.database.insert_import_log(
                 kind="beijing",
                 source_path=beijing_preview.source_path,
                 stored_path=stored_paths["beijing"],
@@ -200,7 +227,8 @@ class InventoryTrackerService:
                 codes=self.config.beijing_codes,
                 import_id=beijing_log,
             )
-            xingwang_log = self.database.insert_import_log(
+            xingwang_reuse = reused_imports["xingwang"]
+            xingwang_log = int(xingwang_reuse["id"]) if xingwang_reuse is not None else self.database.insert_import_log(
                 kind="xingwang",
                 source_path=xingwang_preview.source_path,
                 stored_path=stored_paths["xingwang"],

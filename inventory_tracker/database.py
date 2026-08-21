@@ -179,6 +179,18 @@ class Database:
         row = self.connection.execute("SELECT 1 FROM import_logs WHERE file_hash = ?", (file_hash,)).fetchone()
         return row is not None
 
+    def committed_import_by_hash(self, kind: str, file_hash: str) -> dict[str, object] | None:
+        row = self.connection.execute(
+            """
+            SELECT id, kind, source_path, stored_path, file_hash, business_date, mode, status, report_json, created_at
+            FROM import_logs
+            WHERE kind = ? AND file_hash = ? AND status = 'committed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (kind, file_hash),
+        ).fetchone()
+        return dict(row) if row else None
+
     def insert_import_log(
         self,
         *,
