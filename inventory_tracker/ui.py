@@ -11,6 +11,7 @@ import pandas as pd
 from tkcalendar import DateEntry
 
 from .config import ConfigStore
+from .dashboard import highest_alert_label, toggle_alert_filter
 from .importers import preview_beijing, preview_sales, preview_template, preview_xingwang
 from .service import InventoryTrackerService, OverlapError, OverwriteRequired, ValidationError
 
@@ -59,6 +60,8 @@ class InventoryApp:
         self._preview_snapshot_date: date | None = None
         self.last_report = None
         self.current_frame = pd.DataFrame()
+        self._trend_product_key: tuple[str, str] | None = None
+        self._pending_trend_after_id: str | None = None
         self._build_style()
         self._build_tabs()
         self._refresh_dashboard()
@@ -148,7 +151,7 @@ class InventoryApp:
         self.alert_cards_frame = ttk.Frame(self.dashboard_tab)
         self.alert_cards_frame.pack(fill="x", pady=(0, 8))
         self.alert_card_buttons: dict[str, ttk.Button] = {}
-        for label in ("无库存预警", "增长型缺货风险", "常规低库存", "滞销品预警", "数据质量异常"):
+        for label in ("全部预警", "无库存预警", "增长型缺货风险", "常规低库存", "滞销品预警", "数据质量异常"):
             button = ttk.Button(self.alert_cards_frame, text=f"{label}：0", command=lambda value=label: self._on_alert_card_clicked(value))
             button.pack(side="left", padx=(0, 8))
             self.alert_card_buttons[label] = button
@@ -183,8 +186,8 @@ class InventoryApp:
         self.dashboard_tree.configure(yscrollcommand=scrollbar.set)
         self.dashboard_tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        self.dashboard_tree.bind("<<TreeviewSelect>>", self._on_product_selected)
         self.dashboard_tree.bind("<Button-1>", self._on_dashboard_click)
+        self.dashboard_tree.bind("<Double-1>", self._on_dashboard_double_click)
 
         self.chart_frame = ttk.LabelFrame(self.dashboard_tab, text="商品趋势")
         self.chart_frame.pack(fill="x", pady=(8, 0))
@@ -697,6 +700,7 @@ class InventoryApp:
 
     def _update_alert_cards(self, frame: pd.DataFrame) -> None:
         counts = {label: 0 for label in self.alert_card_buttons}
+        counts["全部预警"] = len(frame)
         if not frame.empty and "alert_labels" in frame:
             for labels in frame["alert_labels"]:
                 for label in labels or []:
@@ -706,29 +710,136 @@ class InventoryApp:
             button.configure(text=f"{label}：{counts[label]}")
 
     def _on_alert_card_clicked(self, label: str) -> None:
+        if label == "全部预警":
+            self.alert_filter.set("全部")
+            self._refresh_dashboard()
+            return
         if label == "数据质量异常":
             self._show_all_quality()
             self.notebook.select(self.quality_tab)
+            return
+        self.alert_filter.set(toggle_alert_filter(self.alert_filter.get(), label))
+        self._refresh_dashboard()
 
     def _on_dashboard_click(self, event) -> str | None:
         row_id = self.dashboard_tree.identify_row(event.y)
         column_id = self.dashboard_tree.identify_column(event.x)
-        if not row_id or column_id != f"#{self.dashboard_columns.index('alert_labels') + 1}":
+        if not row_id:
             return None
         row = self.dashboard_tree.item(row_id, "values")
         if not row:
             return None
-        labels = str(row[-1])
-        if "数据质量异常" in labels:
-            self._show_quality_for_product(
-                _parse_date(self.dashboard_date),
-                str(row[0]),
-                str(row[1]),
-                str(row[2]),
-            )
-            self.notebook.select(self.quality_tab)
+        if column_id == f"#{self.dashboard_columns.index('alert_labels') + 1}":
+            labels = [label.strip() for label in str(row[-1]).split("、") if label.strip()]
+            if "数据质量异常" in labels:
+                self._cancel_pending_trend()
+                self._show_quality_for_product(
+                    _parse_date(self.dashboard_date),
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                )
+                self.notebook.select(self.quality_tab)
+                return "break"
+            selected_label = highest_alert_label(labels)
+            if selected_label:
+                self._cancel_pending_trend()
+                self.alert_filter.set(toggle_alert_filter(self.alert_filter.get(), selected_label))
+                self._refresh_dashboard()
+                return "break"
+        self._schedule_trend_selection(row_id)
+        return "break"
+
+    def _schedule_trend_selection(self, row_id: str) -> None:
+        self._cancel_pending_trend()
+        self._pending_trend_after_id = self.root.after(220, lambda: self._select_trend_row(row_id))
+
+    def _cancel_pending_trend(self) -> None:
+        if self._pending_trend_after_id is not None:
+            try:
+                self.root.after_cancel(self._pending_trend_after_id)
+            except tk.TclError:
+                pass
+            self._pending_trend_after_id = None
+
+    def _select_trend_row(self, row_id: str) -> None:
+        self._pending_trend_after_id = None
+        if not self.dashboard_tree.exists(row_id):
+            return
+        self.dashboard_tree.selection_set(row_id)
+        self.dashboard_tree.focus(row_id)
+        self._trend_product_key = tuple(row_id.split("::", 1))
+        self._show_trend_for_product(*self._trend_product_key)
+
+    def _on_dashboard_double_click(self, event) -> str:
+        row_id = self.dashboard_tree.identify_row(event.y)
+        column_id = self.dashboard_tree.identify_column(event.x)
+        self._cancel_pending_trend()
+        if not row_id:
             return "break"
-        return None
+        row = self.dashboard_tree.item(row_id, "values")
+        if not row:
+            return "break"
+        if column_id == f"#{self.dashboard_columns.index('alert_labels') + 1}":
+            labels = [label.strip() for label in str(row[-1]).split("、") if label.strip()]
+            if "数据质量异常" in labels:
+                self._show_quality_for_product(_parse_date(self.dashboard_date), str(row[0]), str(row[1]), str(row[2]))
+                self.notebook.select(self.quality_tab)
+            elif (selected_label := highest_alert_label(labels)):
+                self.alert_filter.set(toggle_alert_filter(self.alert_filter.get(), selected_label))
+                self._refresh_dashboard()
+            return "break"
+        product_key = tuple(row_id.split("::", 1))
+        if self._trend_product_key == product_key:
+            self._clear_trend()
+        else:
+            self.dashboard_tree.selection_set(row_id)
+            self.dashboard_tree.focus(row_id)
+            self._trend_product_key = product_key
+            self._show_trend_for_product(*product_key)
+        return "break"
+
+    def _clear_trend(self) -> None:
+        self._trend_product_key = None
+        self.dashboard_tree.selection_remove(self.dashboard_tree.selection())
+        for child in self.chart_frame.winfo_children():
+            child.destroy()
+        self.chart_message = ttk.Label(self.chart_frame, text="选择商品查看趋势")
+        self.chart_message.pack(padx=8, pady=8)
+
+    def _show_trend_for_product(self, groupcode: str, product_id: str) -> None:
+        history = self.service.history_for_product(groupcode, product_id)
+        for child in self.chart_frame.winfo_children():
+            child.destroy()
+        if history.empty:
+            ttk.Label(self.chart_frame, text="暂无历史快照").pack(padx=8, pady=8)
+            return
+        if len(history) < 2:
+            ttk.Label(self.chart_frame, text="当前只有一个库存快照，暂时无法形成趋势；导入更多日期后会显示历史曲线。").pack(padx=8, pady=8)
+            return
+        self._draw_product_trend(history, groupcode, product_id)
+
+    def _draw_product_trend(self, history: pd.DataFrame, groupcode: str, product_id: str) -> None:
+        try:
+            _configure_matplotlib_chinese_font()
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+
+            figure = Figure(figsize=(12, 3.2), dpi=90)
+            axis = figure.add_subplot(111)
+            axis.plot(history["snapshot_date"], history["sales"], marker="o", label="销量")
+            axis.plot(history["snapshot_date"], history["stock_total"], marker="o", label="库存总量")
+            axis.plot(history["snapshot_date"], history["in_transit"], marker="o", label="在途库存")
+            axis.plot(history["snapshot_date"], history["moh30"], marker="o", label="30天MOH")
+            axis.plot(history["snapshot_date"], history["moh90"], marker="o", label="90天MOH")
+            axis.set_title(f"{groupcode} / {product_id} 趋势")
+            axis.legend()
+            axis.grid(alpha=0.25)
+            canvas = FigureCanvasTkAgg(figure, master=self.chart_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="x", expand=True)
+        except Exception as error:
+            ttk.Label(self.chart_frame, text=f"图表加载失败：{error}").pack(padx=8, pady=8)
 
     def _on_product_selected(self, _event=None) -> None:
         selection = self.dashboard_tree.selection()
