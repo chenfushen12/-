@@ -790,7 +790,7 @@ class InventoryApp:
                 self._refresh_dashboard()
             return "break"
         product_key = tuple(row_id.split("::", 1))
-        if self._trend_product_key == product_key:
+        if self._trend_product_key is None or self._trend_product_key == product_key:
             self._clear_trend()
         else:
             self.dashboard_tree.selection_set(row_id)
@@ -802,12 +802,12 @@ class InventoryApp:
     def _clear_trend(self) -> None:
         self._trend_product_key = None
         self.dashboard_tree.selection_remove(self.dashboard_tree.selection())
-        for child in self.chart_frame.winfo_children():
-            child.destroy()
-        self.chart_message = ttk.Label(self.chart_frame, text="选择商品查看趋势")
-        self.chart_message.pack(padx=8, pady=8)
+        if self.chart_frame.winfo_ismapped():
+            self.chart_frame.pack_forget()
 
     def _show_trend_for_product(self, groupcode: str, product_id: str) -> None:
+        if not self.chart_frame.winfo_ismapped():
+            self.chart_frame.pack(fill="x", pady=(8, 0))
         history = self.service.history_for_product(groupcode, product_id)
         for child in self.chart_frame.winfo_children():
             child.destroy()
