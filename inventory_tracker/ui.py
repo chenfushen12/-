@@ -569,6 +569,10 @@ class InventoryApp:
             f"当前定位：{snapshot_date.strftime('%Y/%m/%d')} / {groupcode} / {product_id} / {product_name}"
         )
         self._render_quality_details(details, highlight_product=(groupcode, product_id))
+        self.quality_text.delete("1.0", "end")
+        self.quality_text.insert("end", "该问题属于导入批次，无法归属到当前商品；请查看全部导入异常。")
+        if not details["import_issues"]:
+            self.quality_text.insert("end", "\n当前快照没有独立的导入级异常记录。")
 
     def _show_all_quality(self) -> None:
         try:
@@ -579,11 +583,10 @@ class InventoryApp:
         filter_text = self._dashboard_filter_text()
         self.quality_locator_var.set(f"当前定位：{snapshot_date.strftime('%Y/%m/%d')} / 全部商品{filter_text}")
         allowed = set(zip(self.current_frame.get("groupcode", []), self.current_frame.get("product_id", [])))
-        if allowed:
-            details["product_issues"] = [
-                issue for issue in details["product_issues"]
-                if (issue["groupcode"], issue["product_id"]) in allowed
-            ]
+        details["product_issues"] = [
+            issue for issue in details["product_issues"]
+            if (issue["groupcode"], issue["product_id"]) in allowed
+        ]
         self._render_quality_details(details)
 
     def _dashboard_filter_text(self) -> str:
@@ -607,12 +610,15 @@ class InventoryApp:
         selected_iid = None
         for index, issue in enumerate(product_items):
             iid = f"quality-{index}"
+            is_located = highlight_product and (issue["groupcode"], issue["product_id"]) == highlight_product
             self.quality_detail_tree.insert(
                 "", "end", iid=iid,
                 values=("商品级", f"{issue['groupcode']} / {issue['product_id']} / {issue['product_name'] or '-'}", issue["snapshot_date"].strftime("%Y/%m/%d"), issue["reason"], issue["source"]),
+                tags=("located",) if is_located else (),
             )
-            if highlight_product and (issue["groupcode"], issue["product_id"]) == highlight_product:
+            if is_located:
                 selected_iid = iid
+        self.quality_detail_tree.tag_configure("located", background="#fff2a8")
         if selected_iid:
             self.quality_detail_tree.selection_set(selected_iid)
             self.quality_detail_tree.see(selected_iid)
