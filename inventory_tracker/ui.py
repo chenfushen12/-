@@ -192,14 +192,14 @@ class InventoryApp:
         self.chart_frame = ttk.LabelFrame(self.dashboard_tab, text="商品趋势")
         self.chart_frame.pack(fill="x", pady=(8, 0))
         self.chart_window_var = tk.StringVar(value="近7天")
-        self.chart_start_date = DateEntry(self.chart_frame, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
-        self.chart_end_date = DateEntry(self.chart_frame, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
+        self.chart_controls = ttk.Frame(self.chart_frame)
+        self.chart_controls.pack(fill="x", padx=8, pady=6)
+        self.chart_start_date = DateEntry(self.chart_controls, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
+        self.chart_end_date = DateEntry(self.chart_controls, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
         self.chart_start_date.set_date(date.today() - timedelta(days=6))
         self.chart_end_date.set_date(date.today())
         self.chart_show_beijing = tk.BooleanVar(value=False)
         self.chart_show_xingwang = tk.BooleanVar(value=False)
-        self.chart_controls = ttk.Frame(self.chart_frame)
-        self.chart_controls.pack(fill="x", padx=8, pady=6)
         ttk.Label(self.chart_controls, text="时间范围").pack(side="left")
         ttk.Combobox(self.chart_controls, textvariable=self.chart_window_var, values=("近7天", "近30天", "全部快照", "自定义"), state="readonly", width=10).pack(side="left", padx=5)
         ttk.Label(self.chart_controls, text="开始").pack(side="left")
@@ -909,44 +909,6 @@ class InventoryApp:
             canvas = FigureCanvasTkAgg(figure, master=self.chart_plot_frame)
             canvas.draw()
             canvas.get_tk_widget().pack(in_=self.chart_plot_frame, fill="x", expand=True)
-        except Exception as error:
-            ttk.Label(self.chart_frame, text=f"图表加载失败：{error}").pack(padx=8, pady=8)
-
-    def _on_product_selected(self, _event=None) -> None:
-        selection = self.dashboard_tree.selection()
-        if not selection:
-            return
-        values = self.dashboard_tree.item(selection[0], "values")
-        if not values:
-            return
-        groupcode, product_id = values[0], values[1]
-        history = self.service.history_for_product(groupcode, product_id)
-        for child in self.chart_frame.winfo_children():
-            child.destroy()
-        if history.empty:
-            ttk.Label(self.chart_frame, text="暂无历史快照").pack(padx=8, pady=8)
-            return
-        if len(history) < 2:
-            ttk.Label(self.chart_frame, text="当前只有一个库存快照，暂时无法形成趋势；导入更多日期后会显示历史曲线。").pack(padx=8, pady=8)
-            return
-        try:
-            _configure_matplotlib_chinese_font()
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-            from matplotlib.figure import Figure
-
-            figure = Figure(figsize=(12, 3.2), dpi=90)
-            axis = figure.add_subplot(111)
-            axis.plot(history["snapshot_date"], history["sales"], marker="o", label="销量")
-            axis.plot(history["snapshot_date"], history["stock_total"], marker="o", label="库存总量")
-            axis.plot(history["snapshot_date"], history["in_transit"], marker="o", label="在途库存")
-            axis.plot(history["snapshot_date"], history["moh30"], marker="o", label="30天MOH")
-            axis.plot(history["snapshot_date"], history["moh90"], marker="o", label="90天MOH")
-            axis.set_title(f"{groupcode} / {product_id} 趋势")
-            axis.legend()
-            axis.grid(alpha=0.25)
-            canvas = FigureCanvasTkAgg(figure, master=self.chart_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill="x", expand=True)
         except Exception as error:
             ttk.Label(self.chart_frame, text=f"图表加载失败：{error}").pack(padx=8, pady=8)
 
