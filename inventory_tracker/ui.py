@@ -191,7 +191,27 @@ class InventoryApp:
 
         self.chart_frame = ttk.LabelFrame(self.dashboard_tab, text="商品趋势")
         self.chart_frame.pack(fill="x", pady=(8, 0))
-        self.chart_message = ttk.Label(self.chart_frame, text="选择商品查看趋势")
+        self.chart_window_var = tk.StringVar(value="近7天")
+        self.chart_start_date = DateEntry(self.chart_frame, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
+        self.chart_end_date = DateEntry(self.chart_frame, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
+        self.chart_start_date.set_date(date.today() - timedelta(days=6))
+        self.chart_end_date.set_date(date.today())
+        self.chart_show_beijing = tk.BooleanVar(value=False)
+        self.chart_show_xingwang = tk.BooleanVar(value=False)
+        self.chart_controls = ttk.Frame(self.chart_frame)
+        self.chart_controls.pack(fill="x", padx=8, pady=6)
+        ttk.Label(self.chart_controls, text="时间范围").pack(side="left")
+        ttk.Combobox(self.chart_controls, textvariable=self.chart_window_var, values=("近7天", "近30天", "全部快照", "自定义"), state="readonly", width=10).pack(side="left", padx=5)
+        ttk.Label(self.chart_controls, text="开始").pack(side="left")
+        self.chart_start_date.pack(side="left", padx=3)
+        ttk.Label(self.chart_controls, text="结束").pack(side="left")
+        self.chart_end_date.pack(side="left", padx=3)
+        ttk.Button(self.chart_controls, text="应用", command=self._apply_chart_window).pack(side="left", padx=6)
+        ttk.Checkbutton(self.chart_controls, text="北京库存", variable=self.chart_show_beijing, command=self._render_current_trend).pack(side="left", padx=5)
+        ttk.Checkbutton(self.chart_controls, text="星望库存", variable=self.chart_show_xingwang, command=self._render_current_trend).pack(side="left", padx=5)
+        self.chart_plot_frame = ttk.Frame(self.chart_frame)
+        self.chart_plot_frame.pack(fill="x", expand=True)
+        self.chart_message = ttk.Label(self.chart_plot_frame, text="选择商品查看趋势")
         self.chart_message.pack(padx=8, pady=8)
 
     def _build_import(self) -> None:
@@ -808,16 +828,49 @@ class InventoryApp:
     def _show_trend_for_product(self, groupcode: str, product_id: str) -> None:
         if not self.chart_frame.winfo_ismapped():
             self.chart_frame.pack(fill="x", pady=(8, 0))
-        history = self.service.history_for_product(groupcode, product_id)
-        for child in self.chart_frame.winfo_children():
+        self._trend_product_key = (groupcode, product_id)
+        self._trend_history = self.service.history_for_product(groupcode, product_id)
+        self._render_current_trend()
+
+    def _apply_chart_window(self) -> None:
+        try:
+            if self.chart_window_var.get() == "自定义":
+                start_date = self.chart_start_date.get_date()
+                end_date = self.chart_end_date.get_date()
+                if start_date > end_date:
+                    raise ValueError("开始日期不能晚于结束日期")
+            self._render_current_trend()
+        except Exception as error:
+            messagebox.showerror("趋势范围无效", str(error))
+
+    def _render_current_trend(self) -> None:
+        if not hasattr(self, "_trend_history"):
+            return
+        history = self._trend_history
+        groupcode, product_id = self._trend_product_key or ("", "")
+        from .trends import filter_history_window
+
+        try:
+            filtered = filter_history_window(
+                history,
+                self.chart_window_var.get(),
+                start_date=self.chart_start_date.get_date(),
+                end_date=self.chart_end_date.get_date(),
+            )
+        except ValueError as error:
+            for child in self.chart_plot_frame.winfo_children():
+                child.destroy()
+            ttk.Label(self.chart_plot_frame, text=str(error)).pack(padx=8, pady=8)
+            return
+        for child in self.chart_plot_frame.winfo_children():
             child.destroy()
-        if history.empty:
-            ttk.Label(self.chart_frame, text="暂无历史快照").pack(padx=8, pady=8)
+        if filtered.empty:
+            ttk.Label(self.chart_plot_frame, text="当前时间范围没有快照数据").pack(padx=8, pady=8)
             return
-        if len(history) < 2:
-            ttk.Label(self.chart_frame, text="当前只有一个库存快照，暂时无法形成趋势；导入更多日期后会显示历史曲线。").pack(padx=8, pady=8)
+        if len(filtered) < 2:
+            ttk.Label(self.chart_plot_frame, text="当前时间范围只有一个快照，无法形成趋势；请扩大时间范围。").pack(padx=8, pady=8)
             return
-        self._draw_product_trend(history, groupcode, product_id)
+        self._draw_product_trend(filtered, groupcode, product_id)
 
     def _draw_product_trend(self, history: pd.DataFrame, groupcode: str, product_id: str) -> None:
         try:
@@ -825,19 +878,37 @@ class InventoryApp:
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
             from matplotlib.figure import Figure
 
-            figure = Figure(figsize=(12, 3.2), dpi=90)
-            axis = figure.add_subplot(111)
-            axis.plot(history["snapshot_date"], history["sales"], marker="o", label="销量")
-            axis.plot(history["snapshot_date"], history["stock_total"], marker="o", label="库存总量")
-            axis.plot(history["snapshot_date"], history["in_transit"], marker="o", label="在途库存")
-            axis.plot(history["snapshot_date"], history["moh30"], marker="o", label="30天MOH")
-            axis.plot(history["snapshot_date"], history["moh90"], marker="o", label="90天MOH")
-            axis.set_title(f"{groupcode} / {product_id} 趋势")
-            axis.legend()
-            axis.grid(alpha=0.25)
-            canvas = FigureCanvasTkAgg(figure, master=self.chart_frame)
+            import matplotlib.dates as mdates
+
+            figure = Figure(figsize=(12, 6.2), dpi=90)
+            quantity_axis, moh_axis = figure.subplots(2, 1, sharex=True)
+            dates = pd.to_datetime(history["snapshot_date"])
+            quantity_axis.plot(dates, history["sales"], marker="o", label="销量")
+            quantity_axis.plot(dates, history["stock_total"], marker="o", label="总库存量")
+            quantity_axis.plot(dates, history["in_transit"], marker="o", label="在途库存")
+            if self.chart_show_beijing.get():
+                quantity_axis.plot(dates, history["beijing_available"], marker="o", label="北京可用库存")
+            if self.chart_show_xingwang.get():
+                quantity_axis.plot(dates, history["xingwang_available"], marker="o", label="星望可用库存")
+            quantity_axis.set_title(f"{groupcode} / {product_id} 数量趋势")
+            quantity_axis.set_ylabel("数量")
+            quantity_axis.legend(loc="upper left", ncol=3)
+            quantity_axis.grid(alpha=0.25)
+            moh_axis.plot(dates, history["moh30"], marker="o", label="30天MOH")
+            moh_axis.plot(dates, history["moh90"], marker="o", label="90天MOH")
+            moh_axis.axhline(self.service.config.moh30_threshold, color="#d97706", linestyle="--", label="30天阈值")
+            moh_axis.axhline(self.service.config.moh90_threshold, color="#dc2626", linestyle=":", label="90天阈值")
+            moh_axis.set_title("MOH 趋势")
+            moh_axis.set_ylabel("MOH")
+            moh_axis.legend(loc="upper left", ncol=4)
+            moh_axis.grid(alpha=0.25)
+            locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
+            moh_axis.xaxis.set_major_locator(locator)
+            moh_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            figure.tight_layout()
+            canvas = FigureCanvasTkAgg(figure, master=self.chart_plot_frame)
             canvas.draw()
-            canvas.get_tk_widget().pack(fill="x", expand=True)
+            canvas.get_tk_widget().pack(in_=self.chart_plot_frame, fill="x", expand=True)
         except Exception as error:
             ttk.Label(self.chart_frame, text=f"图表加载失败：{error}").pack(padx=8, pady=8)
 

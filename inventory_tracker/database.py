@@ -648,7 +648,8 @@ class Database:
     def history_for_product(self, groupcode: str, product_id: str) -> pd.DataFrame:
         rows = self.connection.execute(
             """
-            SELECT snapshot_date, sales, stock_total, in_transit, moh30, moh90
+            SELECT snapshot_date, sales, beijing_available, xingwang_available,
+                   stock_total, in_transit, moh30, moh90
             FROM tracking_results
             WHERE groupcode = ? AND product_id = ?
             ORDER BY snapshot_date
