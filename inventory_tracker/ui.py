@@ -145,10 +145,17 @@ class InventoryApp:
         summary.pack(fill="x", pady=(0, 8))
         self.summary_var = tk.StringVar(value="尚未加载快照")
         ttk.Label(summary, textvariable=self.summary_var).pack(side="left")
+        self.alert_cards_frame = ttk.Frame(self.dashboard_tab)
+        self.alert_cards_frame.pack(fill="x", pady=(0, 8))
+        self.alert_card_buttons: dict[str, ttk.Button] = {}
+        for label in ("无库存预警", "增长型缺货风险", "常规低库存", "滞销品预警", "数据质量异常"):
+            button = ttk.Button(self.alert_cards_frame, text=f"{label}：0", command=lambda value=label: self._on_alert_card_clicked(value))
+            button.pack(side="left", padx=(0, 8))
+            self.alert_card_buttons[label] = button
 
         table_frame = ttk.Frame(self.dashboard_tab)
         table_frame.pack(fill="both", expand=True)
-        columns = ["groupcode", "product_id", "product_name", "sales", "growth", "stock_total", "sales30", "sales90", "moh30", "moh90", "inventory_status", "alert_labels"]
+        columns = ["groupcode", "product_id", "product_name", "sales", "growth", "beijing_available", "xingwang_available", "in_transit", "stock_total", "sales30", "sales90", "moh30", "moh90", "inventory_status", "alert_labels"]
         self.dashboard_columns = columns
         self.dashboard_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
         headings = {
@@ -157,6 +164,9 @@ class InventoryApp:
             "product_name": "货品名称",
             "sales": "销量",
             "growth": "环比",
+            "beijing_available": "北京可用库存",
+            "xingwang_available": "星望可用库存",
+            "in_transit": "在途库存",
             "stock_total": "库存总量",
             "sales30": "近30天销量",
             "sales90": "近90天销量",
@@ -174,6 +184,7 @@ class InventoryApp:
         self.dashboard_tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.dashboard_tree.bind("<<TreeviewSelect>>", self._on_product_selected)
+        self.dashboard_tree.bind("<Button-1>", self._on_dashboard_click)
 
         self.chart_frame = ttk.LabelFrame(self.dashboard_tab, text="商品趋势")
         self.chart_frame.pack(fill="x", pady=(8, 0))
@@ -336,6 +347,13 @@ class InventoryApp:
 
     def _build_quality(self) -> None:
         ttk.Label(self.quality_tab, text="数据质量报告", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+        self.quality_locator_var = tk.StringVar(value="当前定位：无")
+        ttk.Label(self.quality_tab, textvariable=self.quality_locator_var, foreground="#375a7f").pack(anchor="w", pady=(0, 5))
+        quality_actions = ttk.Frame(self.quality_tab)
+        quality_actions.pack(fill="x", pady=(0, 5))
+        ttk.Button(quality_actions, text="显示全部质量问题", command=self._show_all_quality).pack(side="left")
+        self.quality_detail_text = tk.Text(self.quality_tab, height=10, wrap="word", background="#fff8dc")
+        self.quality_detail_text.pack(fill="x", pady=(0, 8))
         self.quality_text = tk.Text(self.quality_tab, height=35, wrap="word")
         self.quality_text.pack(fill="both", expand=True)
 
@@ -526,6 +544,66 @@ class InventoryApp:
         for issue in report.issues:
             self.quality_text.insert("end", f"[{issue.level.value}] {issue.code}: {issue.message}\n")
 
+    def _show_quality_for_product(self, snapshot_date: date, groupcode: str, product_id: str, product_name: str) -> None:
+        details = self.service.quality_details(snapshot_date, groupcode=groupcode, product_id=product_id)
+        self.quality_locator_var.set(
+            f"当前定位：{snapshot_date.strftime('%Y/%m/%d')} / {groupcode} / {product_id} / {product_name}"
+        )
+        self.quality_detail_text.delete("1.0", "end")
+        product_issues = details["product_issues"]
+        if product_issues:
+            self.quality_detail_text.insert("end", "商品级异常原因（当前商品）\n\n")
+            for issue in product_issues:
+                self.quality_detail_text.insert("end", f"• {issue['reason']}（来源：{issue['source']}）\n")
+        else:
+            self.quality_detail_text.insert("end", "该商品没有商品级数据质量异常。\n")
+        self.quality_detail_text.insert("end", "\n导入级异常无法可靠归属到单个商品，请查看下方全部导入异常。")
+        self.quality_text.delete("1.0", "end")
+        import_issues = details["import_issues"]
+        if import_issues:
+            self.quality_text.insert("end", "全部导入异常\n\n")
+            for issue in import_issues:
+                self.quality_text.insert(
+                    "end",
+                    f"[{issue.get('level')}] {issue.get('kind')} | {issue.get('business_date') or '-'} | "
+                    f"第 {issue.get('row') or '-'} 行 | {issue.get('field') or '-'} | {issue.get('message')}\n",
+                )
+        else:
+            self.quality_text.insert("end", "没有导入级质量问题。")
+        self.quality_detail_text.tag_add("located", "1.0", "end")
+        self.quality_detail_text.tag_configure("located", background="#fff2a8")
+
+    def _show_all_quality(self) -> None:
+        try:
+            snapshot_date = _parse_date(self.dashboard_date)
+        except Exception:
+            snapshot_date = date.today() - timedelta(days=1)
+        details = self.service.quality_details(snapshot_date)
+        self.quality_locator_var.set(f"当前定位：{snapshot_date.strftime('%Y/%m/%d')} / 全部商品")
+        self.quality_detail_text.delete("1.0", "end")
+        product_issues = details["product_issues"]
+        if product_issues:
+            self.quality_detail_text.insert("end", "全部商品级异常\n\n")
+            for issue in product_issues:
+                self.quality_detail_text.insert(
+                    "end",
+                    f"• {issue['groupcode']} / {issue['product_id']} / {issue['product_name'] or '-'}：{issue['reason']}\n",
+                )
+        else:
+            self.quality_detail_text.insert("end", "当前快照没有商品级数据质量异常。")
+        self.quality_text.delete("1.0", "end")
+        import_issues = details["import_issues"]
+        if import_issues:
+            self.quality_text.insert("end", "全部导入异常\n\n")
+            for issue in import_issues:
+                self.quality_text.insert(
+                    "end",
+                    f"[{issue.get('level')}] {issue.get('kind')} | {issue.get('business_date') or '-'} | "
+                    f"第 {issue.get('row') or '-'} 行 | {issue.get('field') or '-'} | {issue.get('message')}\n",
+                )
+        else:
+            self.quality_text.insert("end", "没有导入级质量问题。")
+
     def _refresh_dashboard(self) -> None:
         try:
             snapshot_date = _parse_date(self.dashboard_date.get())
@@ -533,6 +611,7 @@ class InventoryApp:
             if frame.empty:
                 self.summary_var.set("当前日期没有已计算快照")
                 self.current_frame = frame
+                self._update_alert_cards(frame)
                 self._fill_dashboard(frame)
                 return
             search = self.search_text.get().strip().lower()
@@ -557,6 +636,7 @@ class InventoryApp:
             ).sort_values(["_severity", "_low_moh", "_growth_sort"], ascending=[True, True, False]).drop(columns=["_severity", "_low_moh", "_growth_sort"])
             self.current_frame = frame
             self.summary_var.set(f"快照日 {snapshot_date}：{len(frame)} 个商品，{sum(bool(labels) for labels in frame['alert_labels'])} 个含预警标签")
+            self._update_alert_cards(frame)
             self._fill_dashboard(frame)
         except Exception as error:
             self.summary_var.set(f"加载失败：{error}")
@@ -581,8 +661,44 @@ class InventoryApp:
                     value = _format_number(value)
                 values.append(value)
             tag = "risk" if row.get("alert_labels") else ""
-            self.dashboard_tree.insert("", "end", values=values, tags=(tag,))
+            iid = f"{row.get('groupcode')}::{row.get('product_id')}"
+            self.dashboard_tree.insert("", "end", iid=iid, values=values, tags=(tag,))
         self.dashboard_tree.tag_configure("risk", foreground="#9b1c1c")
+
+    def _update_alert_cards(self, frame: pd.DataFrame) -> None:
+        counts = {label: 0 for label in self.alert_card_buttons}
+        if not frame.empty and "alert_labels" in frame:
+            for labels in frame["alert_labels"]:
+                for label in labels or []:
+                    if label in counts:
+                        counts[label] += 1
+        for label, button in self.alert_card_buttons.items():
+            button.configure(text=f"{label}：{counts[label]}")
+
+    def _on_alert_card_clicked(self, label: str) -> None:
+        if label == "数据质量异常":
+            self._show_all_quality()
+            self.notebook.select(self.quality_tab)
+
+    def _on_dashboard_click(self, event) -> str | None:
+        row_id = self.dashboard_tree.identify_row(event.y)
+        column_id = self.dashboard_tree.identify_column(event.x)
+        if not row_id or column_id != f"#{self.dashboard_columns.index('alert_labels') + 1}":
+            return None
+        row = self.dashboard_tree.item(row_id, "values")
+        if not row:
+            return None
+        labels = str(row[-1])
+        if "数据质量异常" in labels:
+            self._show_quality_for_product(
+                _parse_date(self.dashboard_date),
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+            )
+            self.notebook.select(self.quality_tab)
+            return "break"
+        return None
 
     def _on_product_selected(self, _event=None) -> None:
         selection = self.dashboard_tree.selection()

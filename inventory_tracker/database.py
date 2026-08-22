@@ -612,6 +612,28 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def import_quality_issues(self) -> list[dict[str, object]]:
+        issues: list[dict[str, object]] = []
+        rows = self.connection.execute(
+            "SELECT kind, source_path, stored_path, business_date, report_json FROM import_logs ORDER BY id DESC"
+        ).fetchall()
+        for row in rows:
+            try:
+                parsed = json.loads(row["report_json"] or "[]")
+            except json.JSONDecodeError:
+                parsed = []
+            for issue in parsed:
+                issues.append(
+                    {
+                        "kind": row["kind"],
+                        "source_path": row["source_path"],
+                        "stored_path": row["stored_path"],
+                        "business_date": row["business_date"],
+                        **issue,
+                    }
+                )
+        return issues
+
     def history_for_product(self, groupcode: str, product_id: str) -> pd.DataFrame:
         rows = self.connection.execute(
             """

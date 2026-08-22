@@ -265,3 +265,21 @@ def test_batch_delete_missing_date_rolls_back_all_deletions(tmp_path) -> None:
 
     assert len(service.get_snapshot(date(2026, 8, 10))) == 1
     assert service.database.deletion_logs() == []
+
+
+def test_quality_details_separates_product_and_import_issues(tmp_path) -> None:
+    template, sales, beijing, xingwang = _write_inputs(tmp_path)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    previews = (
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+    service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    details = service.quality_details(date(2026, 8, 10), groupcode="G1", product_id="001")
+
+    assert details["is_product_located"] is True
+    assert isinstance(details["product_issues"], list)
+    assert isinstance(details["import_issues"], list)

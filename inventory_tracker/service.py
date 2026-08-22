@@ -454,6 +454,35 @@ class InventoryTrackerService:
     def deletion_logs(self) -> list[dict[str, object]]:
         return self.database.deletion_logs()
 
+    def quality_details(
+        self,
+        snapshot_date: date,
+        *,
+        groupcode: str | None = None,
+        product_id: str | None = None,
+    ) -> dict[str, object]:
+        frame = self.database.load_snapshot(snapshot_date)
+        if groupcode is not None and product_id is not None:
+            frame = frame.loc[(frame["groupcode"] == groupcode) & (frame["product_id"] == product_id)]
+        product_issues: list[dict[str, object]] = []
+        for _, row in frame.iterrows():
+            for label in row.get("quality_labels", []) or []:
+                product_issues.append(
+                    {
+                        "snapshot_date": snapshot_date,
+                        "groupcode": row.get("groupcode"),
+                        "product_id": row.get("product_id"),
+                        "product_name": row.get("product_name"),
+                        "reason": label,
+                        "source": "追踪结果",
+                    }
+                )
+        return {
+            "product_issues": product_issues,
+            "import_issues": self.database.import_quality_issues(),
+            "is_product_located": groupcode is not None and product_id is not None,
+        }
+
     def delete_snapshots(self, dates: list[date], *, confirmed: bool) -> DeletionResult:
         if not confirmed:
             raise ConfirmationRequired("必须在摘要确认后删除快照")
