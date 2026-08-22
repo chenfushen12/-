@@ -479,7 +479,7 @@ class InventoryTrackerService:
                 )
         return {
             "product_issues": product_issues,
-            "import_issues": self.database.import_quality_issues(),
+            "import_issues": self.database.import_quality_issues(snapshot_date),
             "is_product_located": groupcode is not None and product_id is not None,
         }
 

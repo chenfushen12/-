@@ -612,11 +612,22 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def import_quality_issues(self) -> list[dict[str, object]]:
+    def import_quality_issues(self, snapshot_date: date | None = None) -> list[dict[str, object]]:
         issues: list[dict[str, object]] = []
-        rows = self.connection.execute(
-            "SELECT kind, source_path, stored_path, business_date, report_json FROM import_logs ORDER BY id DESC"
-        ).fetchall()
+        if snapshot_date is None:
+            rows = self.connection.execute(
+                "SELECT kind, source_path, stored_path, business_date, report_json FROM import_logs ORDER BY id DESC"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT kind, source_path, stored_path, business_date, report_json
+                FROM import_logs
+                WHERE business_date = ?
+                ORDER BY id DESC
+                """,
+                (_text_date(snapshot_date),),
+            ).fetchall()
         for row in rows:
             try:
                 parsed = json.loads(row["report_json"] or "[]")

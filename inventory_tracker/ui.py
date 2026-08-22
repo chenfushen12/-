@@ -352,10 +352,29 @@ class InventoryApp:
         quality_actions = ttk.Frame(self.quality_tab)
         quality_actions.pack(fill="x", pady=(0, 5))
         ttk.Button(quality_actions, text="显示全部质量问题", command=self._show_all_quality).pack(side="left")
-        self.quality_detail_text = tk.Text(self.quality_tab, height=10, wrap="word", background="#fff8dc")
-        self.quality_detail_text.pack(fill="x", pady=(0, 8))
-        self.quality_text = tk.Text(self.quality_tab, height=35, wrap="word")
-        self.quality_text.pack(fill="both", expand=True)
+        ttk.Label(self.quality_tab, text="商品级异常原因").pack(anchor="w")
+        detail_frame = ttk.Frame(self.quality_tab)
+        detail_frame.pack(fill="x", pady=(0, 8))
+        detail_columns = ("level", "product", "date", "reason", "source")
+        self.quality_detail_tree = ttk.Treeview(detail_frame, columns=detail_columns, show="headings", height=6)
+        for column, heading, width in (("level", "级别", 80), ("product", "商品", 230), ("date", "日期", 110), ("reason", "异常原因", 260), ("source", "来源", 120)):
+            self.quality_detail_tree.heading(column, text=heading)
+            self.quality_detail_tree.column(column, width=width, anchor="w")
+        self.quality_detail_tree.pack(fill="x", expand=True)
+        ttk.Label(self.quality_tab, text="导入级异常（无法可靠归属到单个商品）").pack(anchor="w")
+        import_frame = ttk.Frame(self.quality_tab)
+        import_frame.pack(fill="both", expand=True)
+        import_columns = ("level", "kind", "date", "row", "field", "message", "source_path")
+        self.quality_import_tree = ttk.Treeview(import_frame, columns=import_columns, show="headings", height=12)
+        for column, heading, width in (("level", "级别", 80), ("kind", "类型", 90), ("date", "日期", 110), ("row", "行号", 70), ("field", "字段", 110), ("message", "原因", 420), ("source_path", "来源文件", 260)):
+            self.quality_import_tree.heading(column, text=heading)
+            self.quality_import_tree.column(column, width=width, anchor="w")
+        quality_scroll = ttk.Scrollbar(import_frame, orient="vertical", command=self.quality_import_tree.yview)
+        self.quality_import_tree.configure(yscrollcommand=quality_scroll.set)
+        self.quality_import_tree.pack(side="left", fill="both", expand=True)
+        quality_scroll.pack(side="right", fill="y")
+        self.quality_text = tk.Text(self.quality_tab, height=4, wrap="word")
+        self.quality_text.pack(fill="x", pady=(6, 0))
 
     def _build_settings(self) -> None:
         ttk.Label(self.settings_tab, text="设置", style="Title.TLabel").pack(anchor="w", pady=(0, 12))
@@ -549,29 +568,7 @@ class InventoryApp:
         self.quality_locator_var.set(
             f"当前定位：{snapshot_date.strftime('%Y/%m/%d')} / {groupcode} / {product_id} / {product_name}"
         )
-        self.quality_detail_text.delete("1.0", "end")
-        product_issues = details["product_issues"]
-        if product_issues:
-            self.quality_detail_text.insert("end", "商品级异常原因（当前商品）\n\n")
-            for issue in product_issues:
-                self.quality_detail_text.insert("end", f"• {issue['reason']}（来源：{issue['source']}）\n")
-        else:
-            self.quality_detail_text.insert("end", "该商品没有商品级数据质量异常。\n")
-        self.quality_detail_text.insert("end", "\n导入级异常无法可靠归属到单个商品，请查看下方全部导入异常。")
-        self.quality_text.delete("1.0", "end")
-        import_issues = details["import_issues"]
-        if import_issues:
-            self.quality_text.insert("end", "全部导入异常\n\n")
-            for issue in import_issues:
-                self.quality_text.insert(
-                    "end",
-                    f"[{issue.get('level')}] {issue.get('kind')} | {issue.get('business_date') or '-'} | "
-                    f"第 {issue.get('row') or '-'} 行 | {issue.get('field') or '-'} | {issue.get('message')}\n",
-                )
-        else:
-            self.quality_text.insert("end", "没有导入级质量问题。")
-        self.quality_detail_text.tag_add("located", "1.0", "end")
-        self.quality_detail_text.tag_configure("located", background="#fff2a8")
+        self._render_quality_details(details, highlight_product=(groupcode, product_id))
 
     def _show_all_quality(self) -> None:
         try:
@@ -579,30 +576,57 @@ class InventoryApp:
         except Exception:
             snapshot_date = date.today() - timedelta(days=1)
         details = self.service.quality_details(snapshot_date)
-        self.quality_locator_var.set(f"当前定位：{snapshot_date.strftime('%Y/%m/%d')} / 全部商品")
-        self.quality_detail_text.delete("1.0", "end")
-        product_issues = details["product_issues"]
-        if product_issues:
-            self.quality_detail_text.insert("end", "全部商品级异常\n\n")
-            for issue in product_issues:
-                self.quality_detail_text.insert(
-                    "end",
-                    f"• {issue['groupcode']} / {issue['product_id']} / {issue['product_name'] or '-'}：{issue['reason']}\n",
-                )
-        else:
-            self.quality_detail_text.insert("end", "当前快照没有商品级数据质量异常。")
+        filter_text = self._dashboard_filter_text()
+        self.quality_locator_var.set(f"当前定位：{snapshot_date.strftime('%Y/%m/%d')} / 全部商品{filter_text}")
+        allowed = set(zip(self.current_frame.get("groupcode", []), self.current_frame.get("product_id", [])))
+        if allowed:
+            details["product_issues"] = [
+                issue for issue in details["product_issues"]
+                if (issue["groupcode"], issue["product_id"]) in allowed
+            ]
+        self._render_quality_details(details)
+
+    def _dashboard_filter_text(self) -> str:
+        parts = []
+        if self.search_text.get().strip():
+            parts.append(f"搜索={self.search_text.get().strip()}")
+        if self.category_filter.get() != "全部":
+            parts.append(f"分类={self.category_filter.get()}")
+        if self.alert_filter.get() != "全部":
+            parts.append(f"预警={self.alert_filter.get()}")
+        if self.quality_only.get():
+            parts.append("只看数据质量")
+        return f"（筛选：{'；'.join(parts)}）" if parts else ""
+
+    def _render_quality_details(self, details: dict[str, object], *, highlight_product: tuple[str, str] | None = None) -> None:
+        for item in self.quality_detail_tree.get_children():
+            self.quality_detail_tree.delete(item)
+        for item in self.quality_import_tree.get_children():
+            self.quality_import_tree.delete(item)
+        product_items = details["product_issues"]
+        selected_iid = None
+        for index, issue in enumerate(product_items):
+            iid = f"quality-{index}"
+            self.quality_detail_tree.insert(
+                "", "end", iid=iid,
+                values=("商品级", f"{issue['groupcode']} / {issue['product_id']} / {issue['product_name'] or '-'}", issue["snapshot_date"].strftime("%Y/%m/%d"), issue["reason"], issue["source"]),
+            )
+            if highlight_product and (issue["groupcode"], issue["product_id"]) == highlight_product:
+                selected_iid = iid
+        if selected_iid:
+            self.quality_detail_tree.selection_set(selected_iid)
+            self.quality_detail_tree.see(selected_iid)
+        import_items = details["import_issues"]
+        for index, issue in enumerate(import_items):
+            self.quality_import_tree.insert(
+                "", "end", iid=f"import-{index}",
+                values=(issue.get("level"), issue.get("kind"), issue.get("business_date") or "-", issue.get("row") or "-", issue.get("field") or "-", issue.get("message"), issue.get("source_path")),
+            )
         self.quality_text.delete("1.0", "end")
-        import_issues = details["import_issues"]
-        if import_issues:
-            self.quality_text.insert("end", "全部导入异常\n\n")
-            for issue in import_issues:
-                self.quality_text.insert(
-                    "end",
-                    f"[{issue.get('level')}] {issue.get('kind')} | {issue.get('business_date') or '-'} | "
-                    f"第 {issue.get('row') or '-'} 行 | {issue.get('field') or '-'} | {issue.get('message')}\n",
-                )
-        else:
-            self.quality_text.insert("end", "没有导入级质量问题。")
+        if not product_items and not import_items:
+            self.quality_text.insert("end", "当前定位没有数据质量异常。")
+        elif not import_items:
+            self.quality_text.insert("end", "当前快照没有可关联的导入级质量问题；商品级异常已在上方列出。")
 
     def _refresh_dashboard(self) -> None:
         try:
