@@ -11,6 +11,7 @@ import pandas as pd
 from tkcalendar import DateEntry
 
 from .config import ConfigStore
+from .charting import ChartMode, ChartSelection, METRIC_LABELS, METRICS_BY_MODE, build_chart_figure, format_hover_text
 from .dashboard import highest_alert_label, toggle_alert_filter
 from .importers import preview_beijing, preview_sales, preview_template, preview_xingwang
 from .service import InventoryTrackerService, OverlapError, OverwriteRequired, ValidationError
@@ -92,6 +93,7 @@ class InventoryApp:
         self.current_frame = pd.DataFrame()
         self._trend_product_key: tuple[str, str] | None = None
         self._pending_trend_after_id: str | None = None
+        self.chart_selection = ChartSelection()
         self._build_style()
         self._build_tabs()
         self._refresh_dashboard()
@@ -222,14 +224,18 @@ class InventoryApp:
         self.chart_frame = ttk.LabelFrame(self.dashboard_tab, text="商品趋势")
         self.chart_frame.pack(fill="x", pady=(8, 0))
         self.chart_window_var = tk.StringVar(value="近7天")
+        self.chart_mode_controls = ttk.Frame(self.chart_frame)
+        self.chart_mode_controls.pack(fill="x", padx=8, pady=(6, 0))
+        self.chart_mode_var = tk.StringVar(value=self.chart_selection.mode.value)
+        ttk.Label(self.chart_mode_controls, text="查看").pack(side="left")
+        ttk.Radiobutton(self.chart_mode_controls, text="库存/销量", value=ChartMode.QUANTITY.value, variable=self.chart_mode_var, command=self._on_chart_mode_changed, style="Toolbutton").pack(side="left", padx=2)
+        ttk.Radiobutton(self.chart_mode_controls, text="MOH", value=ChartMode.MOH.value, variable=self.chart_mode_var, command=self._on_chart_mode_changed, style="Toolbutton").pack(side="left", padx=2)
         self.chart_controls = ttk.Frame(self.chart_frame)
-        self.chart_controls.pack(fill="x", padx=8, pady=6)
+        self.chart_controls.pack(fill="x", padx=8, pady=(2, 2))
         self.chart_start_date = DateEntry(self.chart_controls, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
         self.chart_end_date = DateEntry(self.chart_controls, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
         self.chart_start_date.set_date(date.today() - timedelta(days=6))
         self.chart_end_date.set_date(date.today())
-        self.chart_show_beijing = tk.BooleanVar(value=False)
-        self.chart_show_xingwang = tk.BooleanVar(value=False)
         ttk.Label(self.chart_controls, text="时间范围").pack(side="left")
         ttk.Combobox(self.chart_controls, textvariable=self.chart_window_var, values=("近7天", "近30天", "全部快照", "自定义"), state="readonly", width=10).pack(side="left", padx=5)
         ttk.Label(self.chart_controls, text="开始").pack(side="left")
@@ -237,12 +243,89 @@ class InventoryApp:
         ttk.Label(self.chart_controls, text="结束").pack(side="left")
         self.chart_end_date.pack(side="left", padx=3)
         ttk.Button(self.chart_controls, text="应用", command=self._apply_chart_window).pack(side="left", padx=6)
-        ttk.Checkbutton(self.chart_controls, text="北京库存", variable=self.chart_show_beijing, command=self._render_current_trend).pack(side="left", padx=5)
-        ttk.Checkbutton(self.chart_controls, text="星望库存", variable=self.chart_show_xingwang, command=self._render_current_trend).pack(side="left", padx=5)
+        self.chart_metric_controls = ttk.Frame(self.chart_frame)
+        self.chart_metric_controls.pack(fill="x", padx=8, pady=(2, 6))
+        self.chart_metric_vars: dict[str, tk.BooleanVar] = {}
+        self.chart_metric_buttons: dict[str, ttk.Checkbutton] = {}
+        self.chart_metric_label: ttk.Label | None = None
+        self.chart_select_all_button: ttk.Button | None = None
+        self.chart_reset_button: ttk.Button | None = None
+        self.chart_metric_controls.bind("<Configure>", lambda _event: self._layout_chart_metric_controls())
+        self._rebuild_chart_metric_controls()
         self.chart_plot_frame = ttk.Frame(self.chart_frame)
         self.chart_plot_frame.pack(fill="x", expand=True)
         self.chart_message = ttk.Label(self.chart_plot_frame, text="选择商品查看趋势")
         self.chart_message.pack(padx=8, pady=8)
+
+    def _rebuild_chart_metric_controls(self) -> None:
+        for child in self.chart_metric_controls.winfo_children():
+            child.destroy()
+        self.chart_metric_vars = {}
+        self.chart_metric_buttons = {}
+        self.chart_metric_label = ttk.Label(self.chart_metric_controls, text="指标")
+        for metric in METRICS_BY_MODE[self.chart_selection.mode]:
+            variable = tk.BooleanVar(value=metric in self.chart_selection.selected)
+            self.chart_metric_vars[metric] = variable
+            button = ttk.Checkbutton(
+                self.chart_metric_controls,
+                text=METRIC_LABELS[metric],
+                variable=variable,
+                command=lambda name=metric: self._on_chart_metric_changed(name),
+            )
+            self.chart_metric_buttons[metric] = button
+        self.chart_select_all_button = ttk.Button(self.chart_metric_controls, text="全选", command=self._select_all_chart_metrics)
+        self.chart_reset_button = ttk.Button(self.chart_metric_controls, text="恢复默认", command=self._reset_chart_metrics)
+        self._layout_chart_metric_controls()
+
+    def _layout_chart_metric_controls(self) -> None:
+        if self.chart_metric_label is None or self.chart_select_all_button is None or self.chart_reset_button is None:
+            return
+        widgets = [self.chart_metric_label, *self.chart_metric_buttons.values(), self.chart_select_all_button, self.chart_reset_button]
+        for widget in widgets:
+            widget.grid_forget()
+        available_width = max(self.chart_metric_controls.winfo_width(), 420)
+        row = 0
+        column = 0
+        used_width = 0
+        for widget in widgets:
+            requested = widget.winfo_reqwidth() + 10
+            if column and used_width + requested > available_width:
+                row += 1
+                column = 0
+                used_width = 0
+            widget.grid(row=row, column=column, sticky="w", padx=5, pady=2)
+            column += 1
+            used_width += requested
+        self.chart_metric_controls.rowconfigure(row, weight=1)
+
+    def _on_chart_mode_changed(self) -> None:
+        self.chart_selection.set_mode(ChartMode(self.chart_mode_var.get()))
+        self._rebuild_chart_metric_controls()
+        self._render_current_trend()
+
+    def _on_chart_metric_changed(self, metric: str) -> None:
+        changed = self.chart_selection.set_selected(metric, self.chart_metric_vars[metric].get())
+        if not changed:
+            self.chart_metric_vars[metric].set(metric in self.chart_selection.selected)
+        self._render_current_trend()
+
+    def _select_all_chart_metrics(self) -> None:
+        self.chart_selection.select_all()
+        self._rebuild_chart_metric_controls()
+        self._render_current_trend()
+
+    def _reset_chart_metrics(self) -> None:
+        self.chart_selection.reset_defaults()
+        self._rebuild_chart_metric_controls()
+        self._render_current_trend()
+
+    def _update_chart_metric_labels(self, history: pd.DataFrame) -> None:
+        for metric in self.chart_metric_vars:
+            label = METRIC_LABELS[metric]
+            series = history.get(metric)
+            if series is None or not series.notna().any():
+                label += "（暂无数据）"
+            self.chart_metric_buttons[metric].configure(text=label)
 
     def _build_import(self) -> None:
         ttk.Label(self.import_tab, text="导入中心", style="Title.TLabel").pack(anchor="w", pady=(0, 12))
@@ -891,48 +974,57 @@ class InventoryApp:
         for child in self.chart_plot_frame.winfo_children():
             child.destroy()
         if filtered.empty:
-            ttk.Label(self.chart_plot_frame, text="当前时间范围没有快照数据").pack(padx=8, pady=8)
+            self._draw_product_trend(filtered, groupcode, product_id, "当前条件下暂无趋势数据")
             return
-        if len(filtered) < 2:
-            ttk.Label(self.chart_plot_frame, text="当前时间范围只有一个快照，无法形成趋势；请扩大时间范围。").pack(padx=8, pady=8)
-            return
-        self._draw_product_trend(filtered, groupcode, product_id)
+        self._update_chart_metric_labels(filtered)
+        message = "仅有 1 个数据点，无法形成趋势" if len(filtered) == 1 else None
+        self._draw_product_trend(filtered, groupcode, product_id, message)
 
-    def _draw_product_trend(self, history: pd.DataFrame, groupcode: str, product_id: str) -> None:
+    def _draw_product_trend(self, history: pd.DataFrame, groupcode: str, product_id: str, message: str | None = None) -> None:
         try:
             _configure_matplotlib_chinese_font()
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-            from matplotlib.figure import Figure
-
             import matplotlib.dates as mdates
-
-            figure = Figure(figsize=(12, 6.2), dpi=90)
-            quantity_axis, moh_axis = figure.subplots(2, 1, sharex=True)
-            dates = pd.to_datetime(history["snapshot_date"])
-            quantity_axis.plot(dates, history["sales"], marker="o", label="销量")
-            quantity_axis.plot(dates, history["stock_total"], marker="o", label="总库存量")
-            quantity_axis.plot(dates, history["in_transit"], marker="o", label="在途库存")
-            if self.chart_show_beijing.get():
-                quantity_axis.plot(dates, history["beijing_available"], marker="o", label="北京可用库存")
-            if self.chart_show_xingwang.get():
-                quantity_axis.plot(dates, history["xingwang_available"], marker="o", label="星望可用库存")
-            quantity_axis.set_title(f"{groupcode} / {product_id} 数量趋势")
-            quantity_axis.set_ylabel("数量")
-            quantity_axis.legend(loc="upper left", ncol=3)
-            quantity_axis.grid(alpha=0.25)
-            moh_axis.plot(dates, history["moh30"], marker="o", label="30天MOH")
-            moh_axis.plot(dates, history["moh90"], marker="o", label="90天MOH")
-            moh_axis.axhline(self.service.config.moh30_threshold, color="#d97706", linestyle="--", label="30天阈值")
-            moh_axis.axhline(self.service.config.moh90_threshold, color="#dc2626", linestyle=":", label="90天阈值")
-            moh_axis.set_title("MOH 趋势")
-            moh_axis.set_ylabel("MOH")
-            moh_axis.legend(loc="upper left", ncol=4)
-            moh_axis.grid(alpha=0.25)
-            locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
-            moh_axis.xaxis.set_major_locator(locator)
-            moh_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-            figure.tight_layout()
+            figure = build_chart_figure(
+                history,
+                self.chart_selection.selected,
+                self.chart_selection.mode,
+                title=("库存与销量趋势" if self.chart_selection.mode is ChartMode.QUANTITY else "MOH趋势") + f" — {groupcode} / {product_id}",
+                moh30_threshold=self.service.config.moh30_threshold,
+                moh90_threshold=self.service.config.moh90_threshold,
+                empty_message=message,
+            )
             canvas = FigureCanvasTkAgg(figure, master=self.chart_plot_frame)
+            axis = figure.axes[0]
+            hover = axis.annotate(
+                "",
+                xy=(0, 0),
+                xytext=(12, 12),
+                textcoords="offset points",
+                bbox={"boxstyle": "round", "fc": "white", "ec": "#9ca3af", "alpha": 0.95},
+                arrowprops={"arrowstyle": "->", "color": "#6b7280"},
+            )
+            hover.set_visible(False)
+            dates = pd.to_datetime(history.get("snapshot_date", pd.Series(dtype="datetime64[ns]")))
+            date_numbers = mdates.date2num(dates.dt.to_pydatetime()) if not dates.empty else []
+
+            def on_motion(event) -> None:
+                if event.inaxes is not axis or event.xdata is None or not len(date_numbers):
+                    if hover.get_visible():
+                        hover.set_visible(False)
+                        canvas.draw_idle()
+                    return
+                nearest = min(range(len(date_numbers)), key=lambda index: abs(date_numbers[index] - event.xdata))
+                if abs(date_numbers[nearest] - event.xdata) > max(2.0, (max(date_numbers) - min(date_numbers)) * 0.08):
+                    hover.set_visible(False)
+                    canvas.draw_idle()
+                    return
+                hover.xy = (dates.iloc[nearest], axis.get_ylim()[1] * 0.78)
+                hover.set_text(format_hover_text(history, self.chart_selection.selected, nearest))
+                hover.set_visible(True)
+                canvas.draw_idle()
+
+            canvas.mpl_connect("motion_notify_event", on_motion)
             canvas.draw()
             canvas.get_tk_widget().pack(in_=self.chart_plot_frame, fill="x", expand=True)
         except Exception as error:
