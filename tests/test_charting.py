@@ -106,6 +106,28 @@ def test_build_chart_figure_moh_includes_selected_thresholds_and_infinity_marker
     assert any(text.get_text() == "∞" for text in axis.texts)
 
 
+def test_build_chart_figure_merges_equal_moh_threshold_labels() -> None:
+    history = pd.DataFrame(
+        {
+            "snapshot_date": pd.to_datetime(["2026-08-01"]),
+            "moh30": [2.0],
+            "moh90": [3.0],
+        }
+    )
+    figure = build_chart_figure(
+        history,
+        ("moh30", "moh90"),
+        ChartMode.MOH,
+        title="MOH趋势 — G1 / P1",
+        moh30_threshold=2.5,
+        moh90_threshold=2.5,
+    )
+
+    threshold_lines = [line for line in figure.axes[0].lines if line.get_label() != "30天MOH" and line.get_label() != "90天MOH"]
+    assert len(threshold_lines) == 1
+    assert threshold_lines[0].get_label() == "30天/90天阈值"
+
+
 def test_build_chart_figure_shows_empty_state_inside_plot() -> None:
     figure = build_chart_figure(
         pd.DataFrame(columns=["snapshot_date", "sales"]),
