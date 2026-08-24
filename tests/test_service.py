@@ -46,6 +46,40 @@ def test_batch_commit_calculates_and_persists_snapshot(tmp_path) -> None:
     assert (tmp_path / "data" / "raw").exists()
 
 
+def test_batch_commit_matches_numeric_keys_across_all_four_imports(tmp_path) -> None:
+    template = tmp_path / "template.xlsx"
+    sales = tmp_path / "sales.xlsx"
+    beijing = tmp_path / "beijing.xlsx"
+    xingwang = tmp_path / "xingwang.xlsx"
+    pd.DataFrame(
+        [{"货品分类": "彩片", "GROUPCODE": 100, "货品编号": 123, "货品名称": "商品1"}]
+    ).to_excel(template, index=False)
+    pd.DataFrame(
+        [{"时间": "2026-08-10", "GROUP CODE": 100, "货品编号": 123, "数量": 11}]
+    ).to_excel(sales, index=False)
+    pd.DataFrame(
+        [{"库房": "CB", "产品组": 100, "产品": 123, "可用数": 20}]
+    ).to_excel(beijing, index=False)
+    pd.DataFrame(
+        [{"GROUPCODE(货)": 100, "货品编号": 123, "可用库存": 10, "采购在途": 5, "近90天销量(库存公式)": 10, "近30天销量": 10}]
+    ).to_excel(xingwang, index=False)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    previews = (
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+    )
+
+    result = service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    assert result.status == "complete"
+    row = service.get_snapshot(date(2026, 8, 10)).iloc[0]
+    assert row["groupcode"] == "100"
+    assert row["product_id"] == "123"
+    assert row["stock_total"] == 35
+
+
 def test_batch_requires_confirmation_and_rejects_overlapping_sales(tmp_path) -> None:
     template, sales, beijing, xingwang = _write_inputs(tmp_path)
     service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")

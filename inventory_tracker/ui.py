@@ -16,6 +16,20 @@ from .importers import preview_beijing, preview_sales, preview_template, preview
 from .service import InventoryTrackerService, OverlapError, OverwriteRequired, ValidationError
 
 
+IMPORT_KIND_LABELS = {
+    "template": "商品主模板",
+    "sales": "销售数据",
+    "beijing": "北京库存",
+    "xingwang": "星望库存",
+}
+
+ISSUE_LEVEL_LABELS = {
+    "blocking": "阻断",
+    "warning": "警告",
+    "info": "提示",
+}
+
+
 def _parse_date(value: object) -> date:
     if isinstance(value, date):
         return value
@@ -32,6 +46,22 @@ def _format_number(value: object) -> str:
     if isinstance(value, float):
         return f"{value:.2f}"
     return str(value)
+
+
+def format_import_previews(previews: tuple[object, ...]) -> str:
+    lines: list[str] = []
+    for preview in previews:
+        kind_label = IMPORT_KIND_LABELS.get(preview.kind, preview.kind)
+        source_name = Path(preview.source_path).name
+        lines.append(f"{kind_label}｜{source_name}：读取 {len(preview.frame)} 行")
+        visible_issues = preview.report.issues[:8]
+        for issue in visible_issues:
+            level_label = ISSUE_LEVEL_LABELS.get(issue.level.value, issue.level.value)
+            lines.append(f"  [{level_label}] {issue.message}")
+        hidden_count = len(preview.report.issues) - len(visible_issues)
+        if hidden_count:
+            lines.append(f"  …另有 {hidden_count} 项问题，请在数据质量页查看")
+    return "\n".join(lines)
 
 
 def _configure_matplotlib_chinese_font() -> None:
@@ -501,12 +531,8 @@ class InventoryApp:
         self._preview_snapshot_date = snapshot_date
         self.last_report = report = self._combine_reports(previews)
         self._show_report(report)
-        lines = []
-        for preview in previews:
-            lines.append(f"{preview.kind}: {len(preview.frame)} 行，文件哈希 {preview.file_hash[:12]}…")
-            lines.extend(f"  [{issue.level.value}] {issue.message}" for issue in preview.report.issues[:8])
         self.preview_text.delete("1.0", "end")
-        self.preview_text.insert("end", "\n".join(lines))
+        self.preview_text.insert("end", format_import_previews(previews))
         self.import_status.set(f"预检查完成：{len(report.blocking)} 个阻断，{len(report.warnings)} 个警告，{len(report.infos)} 个提示；快照日 {snapshot_date}")
 
     @staticmethod

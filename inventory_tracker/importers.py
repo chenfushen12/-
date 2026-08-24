@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Mapping
+from decimal import Decimal, InvalidOperation
+from numbers import Number
 from pathlib import Path
 from typing import Any
 
@@ -67,15 +69,37 @@ def _canonicalize(
         if field not in mapped:
             report.add(IssueLevel.BLOCKING, "missing_column", f"缺少必填列: {field}", field=field)
 
+    if any(field not in mapped for field in required):
+        return pd.DataFrame()
+
     result = pd.DataFrame(index=frame.index)
+    source_columns: dict[str, tuple[int, str]] = {}
     for canonical, source in mapped.items():
         result[canonical] = frame[source]
+        source_columns[canonical] = (list(frame.columns).index(source) + 1, str(source))
+    result.attrs["source_columns"] = source_columns
     return result
+
+
+def _is_numeric_key(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (Number, Decimal)):
+        return False
+    try:
+        return not bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _clean_key(value: Any) -> str | None:
     if value is None or pd.isna(value):
         return None
+    if _is_numeric_key(value):
+        try:
+            numeric = Decimal(str(value))
+            if numeric.is_finite():
+                return format(numeric.normalize(), "f")
+        except (InvalidOperation, ValueError):
+            pass
     cleaned = str(value).strip()
     return cleaned or None
 
@@ -85,17 +109,25 @@ def _clean_keys(
     report: QualityReport,
     *,
     code: str,
+    source_name: str,
     missing_level: IssueLevel = IssueLevel.WARNING,
 ) -> pd.DataFrame:
     result = frame.copy()
+    source_columns = frame.attrs.get("source_columns", {})
     for column in ("groupcode", "product_id"):
-        numeric_values = result[column].map(lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and not pd.isna(value))
-        for index in result.index[numeric_values]:
+        numeric_values = result[column].map(_is_numeric_key)
+        numeric_rows = list(result.index[numeric_values])
+        if numeric_rows:
+            column_number, source_header = source_columns.get(column, ("?", column))
+            excel_rows = [int(index) + 2 for index in numeric_rows]
+            shown_rows = "、".join(str(row) for row in excel_rows[:5])
+            if len(excel_rows) > 5:
+                shown_rows += " 等"
             report.add(
-                IssueLevel.BLOCKING,
-                "numeric_key_format",
-                "商品主键以数字读取，可能已经丢失前导零；请将 Excel 列设置为文本后重试",
-                row=int(index) + 2,
+                IssueLevel.WARNING,
+                "numeric_key_converted",
+                f"{source_name} 的第 {column_number} 列「{source_header}」发现 {len(numeric_rows)} 个数字商品主键"
+                f"（Excel 行 {shown_rows}），已自动转换为文本；若原编号包含前导零，Excel 可能已经将其丢失，请核对",
                 field=column,
             )
         result[column] = result[column].map(_clean_key)
@@ -148,7 +180,13 @@ def preview_template(path: str | Path) -> ImportPreview:
     if frame.empty and not report.blocking:
         report.add(IssueLevel.BLOCKING, "empty_template", "商品主模板没有有效数据")
     if not frame.empty:
-        frame = _clean_keys(frame, report, code="template_missing_key", missing_level=IssueLevel.BLOCKING)
+        frame = _clean_keys(
+            frame,
+            report,
+            code="template_missing_key",
+            source_name=Path(path).name,
+            missing_level=IssueLevel.BLOCKING,
+        )
         if frame.empty:
             report.add(IssueLevel.BLOCKING, "empty_template", "商品主模板没有有效商品主键")
         for optional in ("category", "groupname", "product_name", "note"):
@@ -185,7 +223,7 @@ def preview_sales(path: str | Path) -> ImportPreview:
     valid_dates = frame.loc[~invalid_dates, "business_date"]
     imported_dates = tuple(sorted(set(valid_dates.tolist())))
     frame = frame.loc[~invalid_dates].copy()
-    frame = _clean_keys(frame, report, code="sales_missing_key")
+    frame = _clean_keys(frame, report, code="sales_missing_key", source_name=Path(path).name)
     frame = frame.dropna(subset=["quantity"])
     negative_keys = {
         (row["business_date"], str(row["groupcode"]).strip(), str(row["product_id"]).strip())
@@ -227,7 +265,7 @@ def _preview_inventory(
     if filter_codes is not None:
         codes = frame["warehouse_code"].map(_clean_key)
         frame = frame.loc[codes.isin(filter_codes)].copy()
-    frame = _clean_keys(frame, report, code="inventory_missing_key")
+    frame = _clean_keys(frame, report, code="inventory_missing_key", source_name=Path(path).name)
     for field in numeric_fields:
         frame[field] = _parse_numeric(frame[field], report, required=False, field=field)
     if not frame.empty:
