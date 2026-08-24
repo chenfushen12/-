@@ -208,5 +208,6 @@ def build_chart_figure(
         visible_handles = [handle for handle, label in zip(handles, labels) if label in selected_labels]
         visible_labels = [label for label in labels if label in selected_labels]
         axis.legend(visible_handles, visible_labels, loc="lower left", bbox_to_anchor=(0, 1.01), ncol=min(5, len(selected_metrics)), frameon=False, borderaxespad=0)
-    figure.tight_layout()
+    # Reserve space above the axes for the external legend and threshold labels.
+    figure.subplots_adjust(left=0.08, right=0.98, bottom=0.14, top=0.78)
     return figure
