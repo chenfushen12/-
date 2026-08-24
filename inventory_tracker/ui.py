@@ -231,7 +231,6 @@ class InventoryApp:
         ttk.Radiobutton(self.chart_mode_controls, text="库存/销量", value=ChartMode.QUANTITY.value, variable=self.chart_mode_var, command=self._on_chart_mode_changed, style="Toolbutton").pack(side="left", padx=2)
         ttk.Radiobutton(self.chart_mode_controls, text="MOH", value=ChartMode.MOH.value, variable=self.chart_mode_var, command=self._on_chart_mode_changed, style="Toolbutton").pack(side="left", padx=2)
         self.chart_controls = ttk.Frame(self.chart_frame)
-        self.chart_controls.pack(fill="x", padx=8, pady=(2, 2))
         self.chart_start_date = DateEntry(self.chart_controls, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
         self.chart_end_date = DateEntry(self.chart_controls, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=12)
         self.chart_start_date.set_date(date.today() - timedelta(days=6))
@@ -252,6 +251,7 @@ class InventoryApp:
         self.chart_reset_button: ttk.Button | None = None
         self.chart_metric_controls.bind("<Configure>", lambda _event: self._layout_chart_metric_controls())
         self._rebuild_chart_metric_controls()
+        self.chart_controls.pack(fill="x", padx=8, pady=(2, 2))
         self.chart_plot_frame = ttk.Frame(self.chart_frame)
         self.chart_plot_frame.pack(fill="x", expand=True)
         self.chart_message = ttk.Label(self.chart_plot_frame, text="选择商品查看趋势")
