@@ -190,7 +190,7 @@ def build_chart_figure(
         for metric, value in visible:
             grouped.setdefault(float(value), []).append(metric)
         for value, metrics in grouped.items():
-            names = "/".join(METRIC_LABELS[metric].replace("MOH", "") + "阈值" for metric in metrics)
+            names = "/".join(METRIC_LABELS[metric].replace("MOH", "") for metric in metrics) + "阈值"
             color = METRIC_COLORS[metrics[0]]
             axis.axhline(value, color=color, linestyle=":", alpha=0.72, label=names)
             axis.annotate(names, xy=(1, value), xycoords=("axes fraction", "data"), xytext=(-4, 4), textcoords="offset points", ha="right", color=color, fontsize=8)

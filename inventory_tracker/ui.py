@@ -973,10 +973,10 @@ class InventoryApp:
             return
         for child in self.chart_plot_frame.winfo_children():
             child.destroy()
+        self._update_chart_metric_labels(filtered)
         if filtered.empty:
             self._draw_product_trend(filtered, groupcode, product_id, "当前条件下暂无趋势数据")
             return
-        self._update_chart_metric_labels(filtered)
         message = "仅有 1 个数据点，无法形成趋势" if len(filtered) == 1 else None
         self._draw_product_trend(filtered, groupcode, product_id, message)
 
