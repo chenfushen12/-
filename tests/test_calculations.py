@@ -69,14 +69,87 @@ def test_calculates_growth_moh_and_combined_alerts() -> None:
     assert first["sales30"] == 20
     assert first["sales90"] == 20
     assert first["moh30"] == 1.5
-    assert first["moh90"] == 1.5
+    assert first["moh90"] == 4.5
     assert "增长型缺货风险" in first["alert_labels"]
     assert "常规低库存" in first["alert_labels"]
 
     second = result.loc[result["product_id"] == "P2"].iloc[0]
     assert second["sales"] == 0
     assert second["sales_status"] == "confirmed_no_sales"
+    assert pd.isna(second["moh30"])
+    assert pd.isna(second["moh90"])
     assert "无库存预警" in second["alert_labels"]
+    assert "滞销品预警" in second["alert_labels"]
+
+
+def test_window_completeness_is_checked_per_product_key() -> None:
+    snapshot_date = date(2026, 8, 10)
+    products = pd.DataFrame(
+        [
+            {"groupcode": "G1", "product_id": "SPARSE"},
+            {"groupcode": "G1", "product_id": "COMPLETE"},
+        ]
+    )
+    sales = pd.DataFrame(
+        [
+            {"business_date": snapshot_date, "groupcode": "G1", "product_id": "SPARSE", "quantity": 3},
+            *[
+                {
+                    "business_date": snapshot_date - timedelta(days=offset),
+                    "groupcode": "G1",
+                    "product_id": "COMPLETE",
+                    "quantity": 2,
+                }
+                for offset in range(90)
+            ],
+        ]
+    )
+    beijing = pd.DataFrame(
+        [
+            {"groupcode": "G1", "product_id": "SPARSE", "beijing_available": 1},
+            {"groupcode": "G1", "product_id": "COMPLETE", "beijing_available": 1},
+        ]
+    )
+    xingwang = pd.DataFrame(
+        [
+            {
+                "groupcode": "G1",
+                "product_id": "SPARSE",
+                "xingwang_available": 1,
+                "in_transit": 0,
+                "source_sales90": 90,
+                "source_sales30": 30,
+            },
+            {
+                "groupcode": "G1",
+                "product_id": "COMPLETE",
+                "xingwang_available": 1,
+                "in_transit": 0,
+                "source_sales90": 90,
+                "source_sales30": 30,
+            },
+        ]
+    )
+
+    result = calculate_tracking(
+        products,
+        sales,
+        beijing,
+        xingwang,
+        snapshot_date=snapshot_date,
+        imported_sales_dates=_dates(snapshot_date, 90),
+        inventory_complete=True,
+        config=TrackerConfig(),
+    ).set_index("product_id")
+
+    assert result.loc["SPARSE", "sales30"] == 30
+    assert result.loc["SPARSE", "sales90"] == 90
+    assert result.loc["SPARSE", "sales30_status"] == "historical_shortage"
+    assert result.loc["SPARSE", "sales90_status"] == "historical_shortage"
+    assert result.loc["COMPLETE", "sales30"] == 60
+    assert result.loc["COMPLETE", "sales90"] == 180
+    assert result.loc["COMPLETE", "sales30_status"] == "calculated"
+    assert result.loc["COMPLETE", "sales90_status"] == "calculated"
 
 
 def test_uses_independent_fallback_for_incomplete_window() -> None:
@@ -116,6 +189,54 @@ def test_uses_independent_fallback_for_incomplete_window() -> None:
     assert row["sales30_status"] == "historical_shortage"
     assert row["sales90_status"] == "historical_shortage"
     assert "历史不足" in row["quality_labels"]
+
+
+def test_uses_calculated_30_day_sales_and_fallback_90_day_sales_independently() -> None:
+    snapshot_date = date(2026, 8, 10)
+    products = pd.DataFrame([{"groupcode": "G1", "product_id": "P1"}])
+    sales = pd.DataFrame(
+        [
+            {
+                "business_date": snapshot_date - timedelta(days=offset),
+                "groupcode": "G1",
+                "product_id": "P1",
+                "quantity": 2,
+            }
+            for offset in range(30)
+        ]
+    )
+    beijing = pd.DataFrame([{"groupcode": "G1", "product_id": "P1", "beijing_available": 20}])
+    xingwang = pd.DataFrame(
+        [
+            {
+                "groupcode": "G1",
+                "product_id": "P1",
+                "xingwang_available": 10,
+                "in_transit": 0,
+                "source_sales90": 90,
+                "source_sales30": 999,
+            }
+        ]
+    )
+
+    result = calculate_tracking(
+        products,
+        sales,
+        beijing,
+        xingwang,
+        snapshot_date=snapshot_date,
+        imported_sales_dates=_dates(snapshot_date, 30),
+        inventory_complete=True,
+        config=TrackerConfig(),
+    )
+
+    row = result.iloc[0]
+    assert row["sales30"] == 60
+    assert row["sales30_status"] == "calculated"
+    assert row["sales90"] == 90
+    assert row["sales90_status"] == "historical_shortage"
+    assert row["moh30"] == 0.5
+    assert row["moh90"] == 1.0
 
 
 def test_partial_inventory_suppresses_stock_alerts() -> None:

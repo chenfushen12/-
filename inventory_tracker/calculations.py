@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from datetime import date, timedelta
 from typing import Iterable
 
@@ -52,6 +51,15 @@ def _sales_lookup(sales: pd.DataFrame) -> dict[tuple[date, str, str], float]:
     return {index: float(value) for index, value in grouped.items() if not _is_missing(value)}
 
 
+def _sales_dates_by_key(
+    sales_lookup: dict[tuple[date, str, str], float],
+) -> dict[tuple[str, str], set[date]]:
+    dates_by_key: dict[tuple[str, str], set[date]] = {}
+    for business_date, groupcode, product_id in sales_lookup:
+        dates_by_key.setdefault((groupcode, product_id), set()).add(business_date)
+    return dates_by_key
+
+
 def _inventory_lookup(frame: pd.DataFrame, value_columns: Iterable[str]) -> dict[tuple[str, str], dict[str, float | None]]:
     if frame is None or frame.empty:
         return {}
@@ -68,24 +76,24 @@ def _inventory_lookup(frame: pd.DataFrame, value_columns: Iterable[str]) -> dict
 
 def _window_total(
     sales_lookup: dict[tuple[date, str, str], float],
-    imported_dates: set[date],
+    sales_dates_by_key: dict[tuple[str, str], set[date]],
     snapshot_date: date,
     days: int,
     item_key: tuple[str, str],
     fallback: float | None,
 ) -> tuple[float | None, str]:
     window = {snapshot_date - timedelta(days=offset) for offset in range(days)}
-    if window.issubset(imported_dates):
+    if window.issubset(sales_dates_by_key.get(item_key, set())):
         return sum(sales_lookup.get((business_date, *item_key), 0.0) for business_date in window), "calculated"
     return fallback, "historical_shortage"
 
 
-def _moh(stock_total: float | None, sales_total: float | None) -> float | None:
+def _moh(stock_total: float | None, sales_total: float | None, *, window_months: float) -> float | None:
     if stock_total is None or sales_total is None or sales_total < 0:
         return None
     if sales_total == 0:
-        return math.inf
-    return stock_total / sales_total
+        return None
+    return stock_total / (sales_total / window_months)
 
 
 def _labels(
@@ -104,7 +112,7 @@ def _labels(
     if inventory_complete and stock_total is not None:
         if stock_total <= 0:
             labels.add("无库存预警")
-        elif sales30 == 0 or sales90 == 0:
+        if sales30 == 0 or sales90 == 0:
             labels.add("滞销品预警")
 
         low30 = moh30 is not None and moh30 <= config.moh30_threshold
@@ -138,6 +146,7 @@ def calculate_tracking(
     """
 
     sales_lookup = _sales_lookup(sales)
+    sales_dates_by_key = _sales_dates_by_key(sales_lookup)
     beijing_lookup = _inventory_lookup(beijing_inventory, ("beijing_available",))
     xingwang_lookup = _inventory_lookup(
         xingwang_inventory,
@@ -178,7 +187,7 @@ def calculate_tracking(
         xingwang = xingwang_lookup.get(item_key, {})
         sales90, sales90_status = _window_total(
             sales_lookup,
-            imported_dates,
+            sales_dates_by_key,
             snapshot_date,
             90,
             item_key,
@@ -186,7 +195,7 @@ def calculate_tracking(
         )
         sales30, sales30_status = _window_total(
             sales_lookup,
-            imported_dates,
+            sales_dates_by_key,
             snapshot_date,
             30,
             item_key,
@@ -223,8 +232,8 @@ def calculate_tracking(
         stock_total: float | None = None
         if inventory_complete and all(value is not None for value in (beijing_available, xingwang_available, in_transit)):
             stock_total = beijing_available + xingwang_available + in_transit
-        moh30 = _moh(stock_total, sales30)
-        moh90 = _moh(stock_total, sales90)
+        moh30 = _moh(stock_total, sales30, window_months=1)
+        moh90 = _moh(stock_total, sales90, window_months=3)
         labels = _labels(
             stock_total=stock_total,
             sales30=sales30,
