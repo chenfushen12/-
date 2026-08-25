@@ -153,8 +153,8 @@ def calculate_tracking(
         ("xingwang_available", "in_transit", "source_sales90", "source_sales30"),
     )
     imported_dates = {_date(value) for value in imported_sales_dates}
-    beijing_loaded = beijing_inventory is not None and not beijing_inventory.empty
-    xingwang_loaded = xingwang_inventory is not None and not xingwang_inventory.empty
+    beijing_loaded = inventory_complete
+    xingwang_loaded = inventory_complete
     rows: list[dict[str, object]] = []
 
     for _, product in products.iterrows():
@@ -230,8 +230,11 @@ def calculate_tracking(
             quality_labels.append("销售包含负销量")
 
         stock_total: float | None = None
-        if inventory_complete and all(value is not None for value in (beijing_available, xingwang_available, in_transit)):
-            stock_total = beijing_available + xingwang_available + in_transit
+        if inventory_complete:
+            stock_total = sum(
+                value if value is not None else 0.0
+                for value in (beijing_available, xingwang_available, in_transit)
+            )
         moh30 = _moh(stock_total, sales30, window_months=1)
         moh90 = _moh(stock_total, sales90, window_months=3)
         labels = _labels(

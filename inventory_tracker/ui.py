@@ -47,6 +47,14 @@ ISSUE_LEVEL_LABELS = {
 }
 
 
+def alert_tag_for_labels(labels: object) -> str:
+    """Return the dashboard row tag for its alert labels."""
+    normalized = (labels,) if isinstance(labels, str) else tuple(labels or ())
+    if normalized == ("数据质量异常",):
+        return "quality_only"
+    return "risk" if normalized else ""
+
+
 def _parse_date(value: object) -> date:
     if isinstance(value, date):
         return value
@@ -847,10 +855,11 @@ class InventoryApp:
                 else:
                     value = _format_number(value)
                 values.append(value)
-            tag = "risk" if row.get("alert_labels") else ""
+            tag = alert_tag_for_labels(row.get("alert_labels"))
             iid = f"{row.get('groupcode')}::{row.get('product_id')}"
             self.dashboard_tree.insert("", "end", iid=iid, values=values, tags=(tag,))
         self.dashboard_tree.tag_configure("risk", foreground="#9b1c1c")
+        self.dashboard_tree.tag_configure("quality_only", foreground="#2563eb")
 
     def _update_alert_cards(self, frame: pd.DataFrame) -> None:
         counts = {label: 0 for label in self.alert_card_buttons}

@@ -266,6 +266,97 @@ def test_partial_inventory_suppresses_stock_alerts() -> None:
     assert "常规低库存" not in row["alert_labels"]
 
 
+def test_unmatched_product_inventory_is_zero_but_still_calculated() -> None:
+    snapshot_date = date(2026, 8, 10)
+    products = pd.DataFrame(
+        [
+            {"groupcode": "G1", "product_id": "MISSING_BEIJING"},
+            {"groupcode": "G1", "product_id": "MISSING_BOTH"},
+        ]
+    )
+    sales = pd.DataFrame(
+        [
+            {
+                "business_date": snapshot_date - timedelta(days=offset),
+                "groupcode": "G1",
+                "product_id": product_id,
+                "quantity": 1,
+            }
+            for product_id in ("MISSING_BEIJING", "MISSING_BOTH")
+            for offset in range(90)
+        ]
+    )
+    beijing = pd.DataFrame(
+        [{"groupcode": "G1", "product_id": "OTHER", "beijing_available": 99}]
+    )
+    xingwang = pd.DataFrame(
+        [
+            {
+                "groupcode": "G1",
+                "product_id": "MISSING_BEIJING",
+                "xingwang_available": 5,
+                "in_transit": None,
+            },
+            {
+                "groupcode": "G1",
+                "product_id": "OTHER",
+                "xingwang_available": 10,
+                "in_transit": 2,
+            },
+        ]
+    )
+
+    result = calculate_tracking(
+        products,
+        sales,
+        beijing,
+        xingwang,
+        snapshot_date=snapshot_date,
+        imported_sales_dates=_dates(snapshot_date, 90),
+        inventory_complete=True,
+        config=TrackerConfig(),
+    ).set_index("product_id")
+
+    missing_beijing = result.loc["MISSING_BEIJING"]
+    assert missing_beijing["stock_total"] == 5
+    assert missing_beijing["moh30"] == 5 / 30
+    assert "北京库存未匹配" in missing_beijing["quality_labels"]
+    assert "数据质量异常" in missing_beijing["alert_labels"]
+
+    missing_both = result.loc["MISSING_BOTH"]
+    assert missing_both["stock_total"] == 0
+    assert missing_both["moh30"] == 0
+    assert "北京库存未匹配" in missing_both["quality_labels"]
+    assert "星望库存未匹配" in missing_both["quality_labels"]
+    assert "无库存预警" in missing_both["alert_labels"]
+
+
+def test_empty_complete_inventory_sources_keep_unmatched_quality_alerts() -> None:
+    snapshot_date = date(2026, 8, 10)
+    products = pd.DataFrame([{"groupcode": "G1", "product_id": "P1"}])
+    empty_beijing = pd.DataFrame(columns=["groupcode", "product_id", "beijing_available"])
+    empty_xingwang = pd.DataFrame(
+        columns=["groupcode", "product_id", "xingwang_available", "in_transit"]
+    )
+
+    result = calculate_tracking(
+        products,
+        pd.DataFrame(),
+        empty_beijing,
+        empty_xingwang,
+        snapshot_date=snapshot_date,
+        imported_sales_dates=set(),
+        inventory_complete=True,
+        config=TrackerConfig(),
+    )
+
+    row = result.iloc[0]
+    assert row["stock_total"] == 0
+    assert "北京库存未匹配" in row["quality_labels"]
+    assert "星望库存未匹配" in row["quality_labels"]
+    assert "数据质量异常" in row["alert_labels"]
+
+
 def test_reevaluate_alerts_uses_current_thresholds_without_changing_metrics() -> None:
     frame = pd.DataFrame(
         [

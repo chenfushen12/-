@@ -1,5 +1,11 @@
 from inventory_tracker.importers import preview_code_mapping, preview_template
-from inventory_tracker.ui import IMPORT_FIELDS, format_import_previews
+from inventory_tracker.ui import IMPORT_FIELDS, alert_tag_for_labels, format_import_previews
+
+
+def test_alert_tag_for_labels_uses_blue_for_quality_only() -> None:
+    assert alert_tag_for_labels(["数据质量异常"]) == "quality_only"
+    assert alert_tag_for_labels(["数据质量异常", "常规低库存"]) == "risk"
+    assert alert_tag_for_labels([]) == ""
 
 
 def test_import_preview_display_shows_file_and_column_but_not_hash(tmp_path) -> None:
