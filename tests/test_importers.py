@@ -176,6 +176,37 @@ def test_normalize_import_previews_keeps_unresolved_source_for_audit_but_hides_i
     assert any(issue.code == "missing_mapping_target" for issue in normalized[0].report.warnings)
 
 
+def test_normalize_import_previews_is_idempotent_for_the_same_mapping(tmp_path) -> None:
+    template_path = tmp_path / "template.xlsx"
+    sales_path = tmp_path / "sales.xlsx"
+    beijing_path = tmp_path / "beijing.xlsx"
+    xingwang_path = tmp_path / "xingwang.xlsx"
+    mapping_path = tmp_path / "mapping.xlsx"
+    pd.DataFrame(
+        [
+            {"GROUPCODE": "OLD", "货品编号": "OLD-01001P", "货品名称": "旧商品"},
+            {"GROUPCODE": "NEW", "货品编号": "NEW-01001P", "货品名称": "新商品"},
+        ]
+    ).to_excel(template_path, index=False)
+    pd.DataFrame([{"时间": "2026-08-10", "GROUP CODE": "OLD", "货品编号": "OLD-01001P", "数量": 1}]).to_excel(sales_path, index=False)
+    pd.DataFrame([{"库房": "CB", "产品组": "OLD", "产品": "OLD-01001P", "可用数": 1}]).to_excel(beijing_path, index=False)
+    pd.DataFrame([{"GROUPCODE(货)": "OLD", "货品编号": "OLD-01001P", "可用库存": 1, "采购在途": 1, "近90天销量(库存公式)": 1, "近30天销量": 1}]).to_excel(xingwang_path, index=False)
+    pd.DataFrame([{"老编号": "OLD", "新编号": "NEW", "名字": ""}]).to_excel(mapping_path, index=False)
+    source = (
+        preview_template(template_path),
+        preview_sales(sales_path),
+        preview_beijing(beijing_path, codes=("CB",)),
+        preview_xingwang(xingwang_path),
+    )
+    mapping = preview_code_mapping(mapping_path)
+
+    once = normalize_import_previews(*source, mapping)
+    twice = normalize_import_previews(*once, mapping)
+
+    assert [len(preview.report.issues) for preview in twice] == [len(preview.report.issues) for preview in once]
+    assert [preview.frame.to_dict("records") for preview in twice] == [preview.frame.to_dict("records") for preview in once]
+
+
 def test_template_preview_deduplicates_identical_rows(tmp_path) -> None:
     path = tmp_path / "template.xlsx"
     rows = [

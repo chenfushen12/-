@@ -496,6 +496,12 @@ def normalize_import_previews(
     """Build dashboard-facing keys while retaining each preview's source frame."""
     if code_mapping is None or code_mapping.frame.empty:
         return template, sales, beijing, xingwang
+    if all(
+        preview.metadata.get("mapping_applied")
+        and preview.metadata.get("mapping_hash") == code_mapping.file_hash
+        for preview in (template, sales, beijing, xingwang)
+    ):
+        return template, sales, beijing, xingwang
     mapping = dict(zip(code_mapping.frame["old_groupcode"], code_mapping.frame["new_groupcode"], strict=False))
     mapping_report = QualityReport()
     targets = _mapping_targets(template.frame, mapping, mapping_report)
@@ -512,6 +518,7 @@ def normalize_import_previews(
         metadata = dict(preview.metadata)
         metadata.setdefault("raw_frame", preview.frame.copy())
         metadata["mapping_applied"] = True
+        metadata["mapping_hash"] = code_mapping.file_hash
         if preview.kind == "sales":
             negative_keys = []
             for value in preview.metadata.get("negative_keys", []):
