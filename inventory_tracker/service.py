@@ -10,7 +10,7 @@ import pandas as pd
 
 from .calculations import calculate_tracking, reevaluate_alerts
 from .database import Database
-from .importers import file_hash
+from .importers import file_hash, normalize_import_previews
 from .models import CommitResult, DeletionResult, ImportPreview, IssueLevel, QualityReport, TrackerConfig
 from .export import export_workbook
 
@@ -61,7 +61,7 @@ class InventoryTrackerService:
         date_part = snapshot_date.isoformat() if snapshot_date else "undated"
         target_dir = self.data_dir / "raw" / preview.kind / date_part
         target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{preview.file_hash}.xlsx"
+        target = target_dir / f"{preview.file_hash}{Path(preview.source_path).suffix.lower() or '.xlsx'}"
         if not target.exists():
             shutil.copy2(preview.source_path, target)
         return str(target)
@@ -129,12 +129,19 @@ class InventoryTrackerService:
         if not any(issue.code == "reused_file" for issue in preview.report.issues):
             preview.report.add(IssueLevel.INFO, "reused_file", f"已复用此前成功导入的 {preview.kind} 文件")
 
+    def active_mapping_preview(self) -> ImportPreview | None:
+        active = self.database.active_code_mapping()
+        if active is None or active[1].empty:
+            return None
+        return ImportPreview("code_mapping", "当前生效替换表", "", active[1], QualityReport())
+
     def commit_batch(
         self,
         template_preview: ImportPreview,
         sales_preview: ImportPreview,
         beijing_preview: ImportPreview,
         xingwang_preview: ImportPreview,
+        code_mapping_preview: ImportPreview | None = None,
         *,
         snapshot_date: date,
         confirmed: bool,
@@ -143,13 +150,23 @@ class InventoryTrackerService:
     ) -> SnapshotResult:
         if not confirmed:
             raise ConfirmationRequired("必须在预览后确认导入")
-        previews = (template_preview, sales_preview, beijing_preview, xingwang_preview)
+        source_previews = (template_preview, sales_preview, beijing_preview, xingwang_preview)
+        effective_mapping_preview = code_mapping_preview or self.active_mapping_preview()
+        normalized_previews = normalize_import_previews(*source_previews, effective_mapping_preview)
+        template_preview, sales_preview, beijing_preview, xingwang_preview = normalized_previews
+        previews = normalized_previews + ((code_mapping_preview,) if code_mapping_preview is not None else ())
         existing_summary = self.database.snapshot_summary(snapshot_date)
         if existing_summary is not None and not overwrite:
             raise OverwriteRequired(existing_summary)
         self._add_future_date_issue(sales_preview, snapshot_date)
         existing_template_version = self.database.template_version_by_hash(template_preview.file_hash)
         reuse_template = existing_template_version is not None
+        existing_mapping_version = (
+            self.database.code_mapping_version_by_hash(code_mapping_preview.file_hash)
+            if code_mapping_preview is not None
+            else None
+        )
+        reuse_mapping = existing_mapping_version is not None
         reused_imports = {
             preview.kind: self.database.committed_import_by_hash(preview.kind, preview.file_hash)
             for preview in previews
@@ -157,7 +174,9 @@ class InventoryTrackerService:
         reused_hashes = {
             preview.file_hash
             for preview in previews
-            if reused_imports[preview.kind] is not None or (preview.kind == "template" and reuse_template)
+            if reused_imports[preview.kind] is not None
+            or (preview.kind == "template" and reuse_template)
+            or (preview.kind == "code_mapping" and reuse_mapping)
         }
         for preview in previews:
             if preview.file_hash in reused_hashes:
@@ -184,6 +203,29 @@ class InventoryTrackerService:
             for preview in previews
         }
         with self.database.transaction():
+            if code_mapping_preview is None:
+                active_mapping = self.database.active_code_mapping()
+                mapping_version_id = active_mapping[0] if active_mapping is not None else None
+            elif reuse_mapping:
+                assert existing_mapping_version is not None
+                self.database.activate_code_mapping_version(existing_mapping_version)
+                mapping_version_id = existing_mapping_version
+            else:
+                self.database.insert_import_log(
+                    kind="code_mapping",
+                    source_path=code_mapping_preview.source_path,
+                    stored_path=stored_paths["code_mapping"],
+                    file_hash=code_mapping_preview.file_hash,
+                    business_date=snapshot_date,
+                    mode="activate",
+                    status="committed",
+                    report_json=self._report_json(code_mapping_preview.report),
+                )
+                mapping_version_id = self.database.insert_code_mapping(
+                    code_mapping_preview.frame,
+                    source_hash=code_mapping_preview.file_hash,
+                    stored_path=stored_paths["code_mapping"],
+                )
             if reuse_template:
                 assert existing_template_version is not None
                 self.database.activate_template_version(existing_template_version)
@@ -200,7 +242,7 @@ class InventoryTrackerService:
                     report_json=self._report_json(template_preview.report),
                 )
                 template_version_id = self.database.insert_template(
-                    template_preview.frame,
+                    template_preview.metadata.get("raw_frame", template_preview.frame),
                     source_hash=template_preview.file_hash,
                     stored_path=stored_paths["template"],
                 )
@@ -222,6 +264,7 @@ class InventoryTrackerService:
                     import_id=sales_log,
                     replace=sales_mode == "replace",
                     negative_keys=[(value[0], str(value[1]), str(value[2])) for value in sales_preview.metadata.get("negative_keys", [])],
+                    raw_frame=sales_preview.metadata.get("raw_frame"),
                 )
             beijing_reuse = reused_imports["beijing"]
             beijing_log = int(beijing_reuse["id"]) if beijing_reuse is not None else self.database.insert_import_log(
@@ -242,6 +285,7 @@ class InventoryTrackerService:
                 stored_path=stored_paths["beijing"],
                 codes=self.config.beijing_codes,
                 import_id=beijing_log,
+                raw_frame=beijing_preview.metadata.get("raw_frame"),
             )
             xingwang_reuse = reused_imports["xingwang"]
             xingwang_log = int(xingwang_reuse["id"]) if xingwang_reuse is not None else self.database.insert_import_log(
@@ -262,12 +306,21 @@ class InventoryTrackerService:
                 stored_path=stored_paths["xingwang"],
                 codes=self.config.beijing_codes,
                 import_id=xingwang_log,
+                raw_frame=xingwang_preview.metadata.get("raw_frame"),
             )
             calculated = self._calculate_and_save(
                 snapshot_date,
                 template_version_id=template_version_id,
+                mapping_version_id=mapping_version_id,
                 beijing_id=beijing_id,
                 xingwang_id=xingwang_id,
+            )
+        if code_mapping_preview is not None and not reuse_mapping and mapping_version_id is not None:
+            self._rebuild_snapshots_for_current_mapping(mapping_version_id)
+            calculated = SnapshotResult(
+                calculated.status,
+                self.database.load_snapshot(snapshot_date),
+                calculated.report,
             )
         combined_report = QualityReport()
         for preview in previews:
@@ -275,6 +328,31 @@ class InventoryTrackerService:
         combined_report.extend(calculated.report)
         calculated.report = combined_report
         return calculated
+
+    def _rebuild_snapshots_for_current_mapping(self, mapping_version_id: int) -> None:
+        active_template = self.database.active_template()
+        if active_template is None:
+            return
+        template_version_id = active_template[0]
+        with self.database.transaction():
+            for snapshot_date in self.database.list_snapshot_dates():
+                meta = self.database.snapshot_meta(snapshot_date)
+                if meta is None:
+                    continue
+                config = TrackerConfig(
+                    growth_threshold=float(meta["threshold_growth"]),
+                    moh30_threshold=float(meta["threshold_moh30"]),
+                    moh90_threshold=float(meta["threshold_moh90"]),
+                    beijing_codes=tuple(json.loads(meta["beijing_codes_json"])),
+                )
+                self._calculate_and_save(
+                    snapshot_date,
+                    template_version_id=template_version_id,
+                    mapping_version_id=mapping_version_id,
+                    beijing_id=self.database.inventory_snapshot_id("beijing", snapshot_date),
+                    xingwang_id=self.database.inventory_snapshot_id("xingwang", snapshot_date),
+                    config=config,
+                )
 
     def commit_template(self, preview: ImportPreview, *, snapshot_date: date | None = None, confirmed: bool) -> CommitResult:
         if not confirmed:
@@ -299,6 +377,9 @@ class InventoryTrackerService:
                 report_json=self._report_json(preview.report),
             )
             self.database.insert_template(preview.frame, source_hash=preview.file_hash, stored_path=stored_path)
+        active_mapping = self.database.active_code_mapping()
+        if active_mapping is not None:
+            self._rebuild_snapshots_for_current_mapping(active_mapping[0])
         return CommitResult(import_id, "商品模板已启用", preview.report)
 
     def commit_sales(self, preview: ImportPreview, *, mode: str, confirmed: bool) -> CommitResult:
@@ -400,17 +481,54 @@ class InventoryTrackerService:
         snapshot_date: date,
         *,
         template_version_id: int,
+        mapping_version_id: int | None = None,
         beijing_id: int | None,
         xingwang_id: int | None,
         config: TrackerConfig | None = None,
     ) -> SnapshotResult:
-        products = self.database.template_by_id(template_version_id)
-        if products.empty:
+        products_source = self.database.template_by_id(template_version_id)
+        if products_source.empty:
             raise ValidationError(f"模板版本不存在: {template_version_id}")
         calculation_config = config or self.config
-        sales = self.database.load_sales()
-        beijing = self.database.load_inventory("beijing", snapshot_date)
-        xingwang = self.database.load_inventory("xingwang", snapshot_date)
+        if mapping_version_id is None:
+            active_mapping = self.database.active_code_mapping()
+            mapping_version_id = active_mapping[0] if active_mapping is not None else None
+        sales_source = self.database.load_source_sales()
+        beijing_source = self.database.load_source_inventory("beijing", snapshot_date)
+        xingwang_source = self.database.load_source_inventory("xingwang", snapshot_date)
+        mapping = self.database.active_code_mapping()
+        mapping_preview = None
+        if mapping is not None and not mapping[1].empty:
+            mapping_preview = ImportPreview(
+                "code_mapping",
+                "",
+                "",
+                mapping[1],
+                QualityReport(),
+            )
+        raw_negative_keys = [
+            [row["business_date"], row["groupcode"], row["product_id"]]
+            for _, row in sales_source.loc[sales_source["quantity"] < 0].iterrows()
+        ] if not sales_source.empty else []
+        source_previews = (
+            ImportPreview("template", "", "", products_source, QualityReport()),
+            ImportPreview(
+                "sales",
+                "",
+                "",
+                sales_source,
+                QualityReport(),
+                tuple(sorted(self.database.existing_sales_dates())),
+                {"negative_keys": raw_negative_keys},
+            ),
+            ImportPreview("beijing", "", "", beijing_source, QualityReport()),
+            ImportPreview("xingwang", "", "", xingwang_source, QualityReport()),
+        )
+        products_preview, sales_preview, beijing_preview, xingwang_preview = normalize_import_previews(*source_previews, mapping_preview)
+        products = products_preview.frame
+        sales = sales_preview.frame
+        beijing = beijing_preview.frame
+        xingwang = xingwang_preview.frame
         inventory_complete = beijing_id is not None and xingwang_id is not None
         result = calculate_tracking(
             products,
@@ -421,13 +539,18 @@ class InventoryTrackerService:
             imported_sales_dates=self.database.existing_sales_dates(),
             inventory_complete=inventory_complete,
             config=calculation_config,
-            negative_sales_keys=self.database.load_negative_sales_keys(),
+            negative_sales_keys={
+                (str(value[1]), str(value[2]))
+                for value in sales_preview.metadata.get("negative_keys", [])
+                if value[1] is not None and value[2] is not None
+            },
         )
         status = "complete" if inventory_complete else "partial"
         self.database.save_snapshot(
             snapshot_date,
             result,
             template_version_id=template_version_id,
+            mapping_version_id=mapping_version_id,
             beijing_snapshot_id=beijing_id,
             xingwang_snapshot_id=xingwang_id,
             status=status,

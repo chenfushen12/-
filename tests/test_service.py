@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from inventory_tracker.importers import preview_beijing, preview_sales, preview_template, preview_xingwang
+from inventory_tracker.importers import preview_beijing, preview_code_mapping, preview_sales, preview_template, preview_xingwang
 from inventory_tracker.service import InventoryTrackerService, OverlapError, ConfirmationRequired, OverwriteRequired, SnapshotNotFound
 
 
@@ -44,6 +44,147 @@ def test_batch_commit_calculates_and_persists_snapshot(tmp_path) -> None:
     assert len(stored) == 1
     assert stored.iloc[0]["stock_total"] == 35
     assert (tmp_path / "data" / "raw").exists()
+
+
+def test_batch_commit_applies_group_mapping_and_beijing_product_group_alias(tmp_path) -> None:
+    template = tmp_path / "template.xlsx"
+    sales = tmp_path / "sales.xlsx"
+    beijing = tmp_path / "beijing.xlsx"
+    xingwang = tmp_path / "xingwang.xlsx"
+    mapping = tmp_path / "mapping.xlsx"
+    pd.DataFrame(
+        [
+            {"GROUPCODE": "OLD", "货品编号": "OLD-01001P", "货品名称": "旧商品"},
+            {"GROUPCODE": "NEW", "货品编号": "NEW-01001P", "货品名称": "新商品"},
+        ]
+    ).to_excel(template, index=False)
+    pd.DataFrame(
+        [
+            {"时间": "2026-08-10", "GROUP CODE": "OLD", "货品编号": "OLD-01001P", "数量": 2},
+            {"时间": "2026-08-10", "GROUP CODE": "NEW", "货品编号": "NEW-01001P", "数量": 3},
+        ]
+    ).to_excel(sales, index=False)
+    pd.DataFrame(
+        [
+            {"库房": "CB", "产品组": "OLD", "产品": "OLD-01001P", "可用数": 5},
+            {"库房": "CB", "产品组": "NEW", "产品": "NEW-01001P", "可用数": 7},
+        ]
+    ).to_excel(beijing, index=False)
+    pd.DataFrame(
+        [
+            {"GROUPCODE(货)": "OLD", "货品编号": "OLD-01001P", "可用库存": 11, "采购在途": 1, "近90天销量(库存公式)": 13, "近30天销量": 5},
+            {"GROUPCODE(货)": "NEW", "货品编号": "NEW-01001P", "可用库存": 17, "采购在途": 2, "近90天销量(库存公式)": 19, "近30天销量": 7},
+        ]
+    ).to_excel(xingwang, index=False)
+    pd.DataFrame([{"老编号": "OLD", "新编号": "NEW", "名字": ""}]).to_excel(mapping, index=False)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+    previews = (
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+        preview_code_mapping(mapping),
+    )
+
+    result = service.commit_batch(*previews, snapshot_date=date(2026, 8, 10), confirmed=True)
+
+    assert result.status == "complete"
+    stored = service.get_snapshot(date(2026, 8, 10))
+    assert stored[["groupcode", "product_id"]].to_dict("records") == [{"groupcode": "NEW", "product_id": "NEW-01001P"}]
+    row = stored.iloc[0]
+    assert row["product_name"] == "新商品"
+    assert row["sales"] == 5
+    assert row["beijing_available"] == 12
+    assert row["xingwang_available"] == 28
+    assert any(log["kind"] == "code_mapping" for log in service.database.import_logs())
+
+
+def test_new_mapping_rebuilds_previous_snapshot_with_new_dashboard_key(tmp_path) -> None:
+    template_old = tmp_path / "template-old.xlsx"
+    template_new = tmp_path / "template-new.xlsx"
+    sales_old = tmp_path / "sales-old.xlsx"
+    sales_new = tmp_path / "sales-new.xlsx"
+    beijing_old = tmp_path / "beijing-old.xlsx"
+    beijing_new = tmp_path / "beijing-new.xlsx"
+    xingwang_old = tmp_path / "xingwang-old.xlsx"
+    xingwang_new = tmp_path / "xingwang-new.xlsx"
+    mapping = tmp_path / "mapping.xlsx"
+    pd.DataFrame([{"GROUPCODE": "OLD", "货品编号": "OLD-01001P", "货品名称": "旧商品"}]).to_excel(template_old, index=False)
+    pd.DataFrame(
+        [
+            {"GROUPCODE": "OLD", "货品编号": "OLD-01001P", "货品名称": "旧商品"},
+            {"GROUPCODE": "NEW", "货品编号": "NEW-01001P", "货品名称": "新商品"},
+        ]
+    ).to_excel(template_new, index=False)
+    pd.DataFrame([{"时间": "2026-08-10", "GROUP CODE": "OLD", "货品编号": "OLD-01001P", "数量": 2}]).to_excel(sales_old, index=False)
+    pd.DataFrame([{"时间": "2026-08-11", "GROUP CODE": "OLD", "货品编号": "OLD-01001P", "数量": 3}]).to_excel(sales_new, index=False)
+    pd.DataFrame([{"库房": "CB", "产品组": "OLD", "产品": "OLD-01001P", "可用数": 5}]).to_excel(beijing_old, index=False)
+    pd.DataFrame([{"库房": "CB", "产品组": "OLD", "产品": "OLD-01001P", "可用数": 6}]).to_excel(beijing_new, index=False)
+    pd.DataFrame([{"GROUPCODE(货)": "OLD", "货品编号": "OLD-01001P", "可用库存": 1, "采购在途": 1, "近90天销量(库存公式)": 1, "近30天销量": 1}]).to_excel(xingwang_old, index=False)
+    pd.DataFrame([{"GROUPCODE(货)": "OLD", "货品编号": "OLD-01001P", "可用库存": 2, "采购在途": 1, "近90天销量(库存公式)": 1, "近30天销量": 1}]).to_excel(xingwang_new, index=False)
+    pd.DataFrame([{"老编号": "OLD", "新编号": "NEW", "名字": ""}]).to_excel(mapping, index=False)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+
+    service.commit_batch(
+        preview_template(template_old),
+        preview_sales(sales_old),
+        preview_beijing(beijing_old, codes=("CB",)),
+        preview_xingwang(xingwang_old),
+        snapshot_date=date(2026, 8, 10),
+        confirmed=True,
+    )
+    service.commit_batch(
+        preview_template(template_new),
+        preview_sales(sales_new),
+        preview_beijing(beijing_new, codes=("CB",)),
+        preview_xingwang(xingwang_new),
+        preview_code_mapping(mapping),
+        snapshot_date=date(2026, 8, 11),
+        confirmed=True,
+    )
+
+    historical = service.get_snapshot(date(2026, 8, 10))
+
+    assert historical[["groupcode", "product_id"]].to_dict("records") == [{"groupcode": "NEW", "product_id": "NEW-01001P"}]
+    assert historical.iloc[0]["sales"] == 2
+
+    sales_after_mapping = tmp_path / "sales-after-mapping.xlsx"
+    beijing_after_mapping = tmp_path / "beijing-after-mapping.xlsx"
+    xingwang_after_mapping = tmp_path / "xingwang-after-mapping.xlsx"
+    pd.DataFrame([{"时间": "2026-08-12", "GROUP CODE": "OLD", "货品编号": "OLD-01001P", "数量": 4}]).to_excel(sales_after_mapping, index=False)
+    pd.DataFrame([{"库房": "CB", "产品组": "OLD", "产品": "OLD-01001P", "可用数": 7}]).to_excel(beijing_after_mapping, index=False)
+    pd.DataFrame([{"GROUPCODE(货)": "OLD", "货品编号": "OLD-01001P", "可用库存": 3, "采购在途": 1, "近90天销量(库存公式)": 1, "近30天销量": 1}]).to_excel(xingwang_after_mapping, index=False)
+    after_mapping = service.commit_batch(
+        preview_template(template_new),
+        preview_sales(sales_after_mapping),
+        preview_beijing(beijing_after_mapping, codes=("CB",)),
+        preview_xingwang(xingwang_after_mapping),
+        snapshot_date=date(2026, 8, 12),
+        confirmed=True,
+    )
+
+    assert after_mapping.frame[["groupcode", "product_id"]].to_dict("records") == [{"groupcode": "NEW", "product_id": "NEW-01001P"}]
+
+
+def test_mapping_without_target_product_keeps_old_source_out_of_dashboard(tmp_path) -> None:
+    template, sales, beijing, xingwang = _write_inputs(tmp_path)
+    mapping = tmp_path / "mapping.xlsx"
+    pd.DataFrame([{"老编号": "G1", "新编号": "G2", "名字": ""}]).to_excel(mapping, index=False)
+    service = InventoryTrackerService(tmp_path / "app.db", data_dir=tmp_path / "data")
+
+    result = service.commit_batch(
+        preview_template(template),
+        preview_sales(sales),
+        preview_beijing(beijing, codes=("CB",)),
+        preview_xingwang(xingwang),
+        preview_code_mapping(mapping),
+        snapshot_date=date(2026, 8, 10),
+        confirmed=True,
+    )
+
+    assert result.frame.empty
+    assert any(issue.code == "missing_mapping_target" for issue in result.report.warnings)
+    assert service.get_snapshot(date(2026, 8, 10)).empty
 
 
 def test_batch_commit_matches_numeric_keys_across_all_four_imports(tmp_path) -> None:

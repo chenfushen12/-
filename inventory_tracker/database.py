@@ -29,6 +29,21 @@ CREATE TABLE IF NOT EXISTS products (
     PRIMARY KEY (template_version_id, groupcode, product_id),
     FOREIGN KEY (template_version_id) REFERENCES template_versions(id)
 );
+CREATE TABLE IF NOT EXISTS code_mapping_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS code_mappings (
+    version_id INTEGER NOT NULL,
+    old_groupcode TEXT NOT NULL,
+    new_groupcode TEXT NOT NULL,
+    name TEXT,
+    PRIMARY KEY (version_id, old_groupcode),
+    FOREIGN KEY (version_id) REFERENCES code_mapping_versions(id)
+);
 CREATE TABLE IF NOT EXISTS import_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
@@ -63,6 +78,15 @@ CREATE TABLE IF NOT EXISTS sales_negative_keys (
     PRIMARY KEY (business_date, groupcode, product_id),
     FOREIGN KEY (import_id) REFERENCES import_logs(id)
 );
+CREATE TABLE IF NOT EXISTS sales_source_daily (
+    business_date TEXT NOT NULL,
+    groupcode TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    import_id INTEGER NOT NULL,
+    PRIMARY KEY (business_date, groupcode, product_id),
+    FOREIGN KEY (import_id) REFERENCES import_logs(id)
+);
 CREATE TABLE IF NOT EXISTS inventory_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     warehouse TEXT NOT NULL,
@@ -82,7 +106,26 @@ CREATE TABLE IF NOT EXISTS beijing_inventory (
     PRIMARY KEY (snapshot_id, groupcode, product_id),
     FOREIGN KEY (snapshot_id) REFERENCES inventory_snapshots(id)
 );
+CREATE TABLE IF NOT EXISTS beijing_source_inventory (
+    snapshot_id INTEGER NOT NULL,
+    groupcode TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    beijing_available REAL,
+    PRIMARY KEY (snapshot_id, groupcode, product_id),
+    FOREIGN KEY (snapshot_id) REFERENCES inventory_snapshots(id)
+);
 CREATE TABLE IF NOT EXISTS xingwang_inventory (
+    snapshot_id INTEGER NOT NULL,
+    groupcode TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    xingwang_available REAL,
+    in_transit REAL,
+    source_sales90 REAL,
+    source_sales30 REAL,
+    PRIMARY KEY (snapshot_id, groupcode, product_id),
+    FOREIGN KEY (snapshot_id) REFERENCES inventory_snapshots(id)
+);
+CREATE TABLE IF NOT EXISTS xingwang_source_inventory (
     snapshot_id INTEGER NOT NULL,
     groupcode TEXT NOT NULL,
     product_id TEXT NOT NULL,
@@ -96,6 +139,7 @@ CREATE TABLE IF NOT EXISTS xingwang_inventory (
 CREATE TABLE IF NOT EXISTS tracking_meta (
     snapshot_date TEXT PRIMARY KEY,
     template_version_id INTEGER NOT NULL,
+    mapping_version_id INTEGER,
     beijing_snapshot_id INTEGER,
     xingwang_snapshot_id INTEGER,
     status TEXT NOT NULL,
@@ -169,6 +213,11 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
+        tracking_meta_columns = {
+            str(row["name"]) for row in self.connection.execute("PRAGMA table_info(tracking_meta)").fetchall()
+        }
+        if "mapping_version_id" not in tracking_meta_columns:
+            self.connection.execute("ALTER TABLE tracking_meta ADD COLUMN mapping_version_id INTEGER")
         self.connection.commit()
 
     @contextmanager
@@ -258,6 +307,48 @@ class Database:
             )
         return version_id
 
+    def insert_code_mapping(self, frame: pd.DataFrame, *, source_hash: str, stored_path: str) -> int:
+        self.connection.execute("UPDATE code_mapping_versions SET is_active = 0")
+        cursor = self.connection.execute(
+            "INSERT INTO code_mapping_versions (created_at, source_hash, stored_path, is_active) VALUES (?, ?, ?, 1)",
+            (datetime.now().isoformat(timespec="seconds"), source_hash, stored_path),
+        )
+        version_id = int(cursor.lastrowid)
+        for _, row in frame.iterrows():
+            self.connection.execute(
+                "INSERT INTO code_mappings (version_id, old_groupcode, new_groupcode, name) VALUES (?, ?, ?, ?)",
+                (
+                    version_id,
+                    str(row["old_groupcode"]),
+                    str(row["new_groupcode"]),
+                    _sql_value(row.get("name")),
+                ),
+            )
+        return version_id
+
+    def active_code_mapping(self) -> tuple[int, pd.DataFrame] | None:
+        version = self.connection.execute(
+            "SELECT id FROM code_mapping_versions WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if version is None:
+            return None
+        rows = self.connection.execute(
+            "SELECT old_groupcode, new_groupcode, name FROM code_mappings WHERE version_id = ? ORDER BY old_groupcode",
+            (version["id"],),
+        ).fetchall()
+        return int(version["id"]), pd.DataFrame.from_records([dict(row) for row in rows])
+
+    def code_mapping_version_by_hash(self, source_hash: str) -> int | None:
+        row = self.connection.execute(
+            "SELECT id FROM code_mapping_versions WHERE source_hash = ? ORDER BY id DESC LIMIT 1",
+            (source_hash,),
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def activate_code_mapping_version(self, version_id: int) -> None:
+        self.connection.execute("UPDATE code_mapping_versions SET is_active = 0")
+        self.connection.execute("UPDATE code_mapping_versions SET is_active = 1 WHERE id = ?", (version_id,))
+
     def active_template(self) -> tuple[int, pd.DataFrame] | None:
         version = self.connection.execute(
             "SELECT id FROM template_versions WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
@@ -306,11 +397,13 @@ class Database:
         import_id: int,
         replace: bool,
         negative_keys: list[tuple[date, str, str]] | None = None,
+        raw_frame: pd.DataFrame | None = None,
     ) -> None:
         dates = tuple(_text_date(value) for value in imported_dates)
         if replace and dates:
             placeholders = ",".join("?" for _ in dates)
             self.connection.execute(f"DELETE FROM sales_daily WHERE business_date IN ({placeholders})", dates)
+            self.connection.execute(f"DELETE FROM sales_source_daily WHERE business_date IN ({placeholders})", dates)
             self.connection.execute(f"DELETE FROM sales_negative_keys WHERE business_date IN ({placeholders})", dates)
             self.connection.execute(f"DELETE FROM sales_dates WHERE business_date IN ({placeholders})", dates)
         for business_date in imported_dates:
@@ -322,6 +415,22 @@ class Database:
             self.connection.execute(
                 """
                 INSERT OR REPLACE INTO sales_daily
+                    (business_date, groupcode, product_id, quantity, import_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    _text_date(row["business_date"]),
+                    str(row["groupcode"]),
+                    str(row["product_id"]),
+                    float(row["quantity"]),
+                    import_id,
+                ),
+            )
+        source = raw_frame if raw_frame is not None else frame
+        for _, row in source.iterrows():
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO sales_source_daily
                     (business_date, groupcode, product_id, quantity, import_id)
                 VALUES (?, ?, ?, ?, ?)
                 """,
@@ -356,6 +465,7 @@ class Database:
         stored_path: str,
         codes: tuple[str, ...],
         import_id: int,
+        raw_frame: pd.DataFrame | None = None,
     ) -> int:
         warehouse = kind
         self.connection.execute(
@@ -383,6 +493,8 @@ class Database:
         assert snapshot_id is not None
         detail_table = "beijing_inventory" if kind == "beijing" else "xingwang_inventory"
         self.connection.execute(f"DELETE FROM {detail_table} WHERE snapshot_id = ?", (snapshot_id,))
+        source_table = "beijing_source_inventory" if kind == "beijing" else "xingwang_source_inventory"
+        self.connection.execute(f"DELETE FROM {source_table} WHERE snapshot_id = ?", (snapshot_id,))
         for _, row in frame.iterrows():
             if kind == "beijing":
                 self.connection.execute(
@@ -406,12 +518,46 @@ class Database:
                         _sql_value(row.get("source_sales30")),
                     ),
                 )
+        source = raw_frame if raw_frame is not None else frame
+        for _, row in source.iterrows():
+            if kind == "beijing":
+                self.connection.execute(
+                    "INSERT INTO beijing_source_inventory (snapshot_id, groupcode, product_id, beijing_available) VALUES (?, ?, ?, ?)",
+                    (snapshot_id, str(row["groupcode"]), str(row["product_id"]), _sql_value(row.get("beijing_available"))),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    INSERT INTO xingwang_source_inventory
+                        (snapshot_id, groupcode, product_id, xingwang_available, in_transit, source_sales90, source_sales30)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        str(row["groupcode"]),
+                        str(row["product_id"]),
+                        _sql_value(row.get("xingwang_available")),
+                        _sql_value(row.get("in_transit")),
+                        _sql_value(row.get("source_sales90")),
+                        _sql_value(row.get("source_sales30")),
+                    ),
+                )
         return snapshot_id
 
     def load_sales(self) -> pd.DataFrame:
         rows = self.connection.execute("SELECT business_date, groupcode, product_id, quantity FROM sales_daily").fetchall()
         if not rows:
             return pd.DataFrame(columns=["business_date", "groupcode", "product_id", "quantity"])
+        frame = pd.DataFrame.from_records([dict(row) for row in rows])
+        frame["business_date"] = frame["business_date"].map(date.fromisoformat)
+        return frame
+
+    def load_source_sales(self) -> pd.DataFrame:
+        rows = self.connection.execute(
+            "SELECT business_date, groupcode, product_id, quantity FROM sales_source_daily"
+        ).fetchall()
+        if not rows:
+            return self.load_sales()
         frame = pd.DataFrame.from_records([dict(row) for row in rows])
         frame["business_date"] = frame["business_date"].map(date.fromisoformat)
         return frame
@@ -430,12 +576,27 @@ class Database:
         rows = self.connection.execute(f"SELECT * FROM {table} WHERE snapshot_id = ?", (snapshot_id,)).fetchall()
         return pd.DataFrame.from_records([dict(row) for row in rows]).drop(columns=["snapshot_id"], errors="ignore")
 
+    def load_source_inventory(self, kind: str, business_date: date) -> pd.DataFrame:
+        snapshot_id = self.inventory_snapshot_id(kind, business_date)
+        if snapshot_id is None:
+            return self.load_inventory(kind, business_date)
+        table = "beijing_source_inventory" if kind == "beijing" else "xingwang_source_inventory"
+        rows = self.connection.execute(f"SELECT * FROM {table} WHERE snapshot_id = ?", (snapshot_id,)).fetchall()
+        if not rows:
+            return self.load_inventory(kind, business_date)
+        return pd.DataFrame.from_records([dict(row) for row in rows]).drop(columns=["snapshot_id"], errors="ignore")
+
+    def list_snapshot_dates(self) -> list[date]:
+        rows = self.connection.execute("SELECT snapshot_date FROM tracking_meta ORDER BY snapshot_date").fetchall()
+        return [date.fromisoformat(row["snapshot_date"]) for row in rows]
+
     def save_snapshot(
         self,
         snapshot_date: date,
         frame: pd.DataFrame,
         *,
         template_version_id: int,
+        mapping_version_id: int | None,
         beijing_snapshot_id: int | None,
         xingwang_snapshot_id: int | None,
         status: str,
@@ -450,13 +611,14 @@ class Database:
         self.connection.execute(
             """
             INSERT INTO tracking_meta
-                (snapshot_date, template_version_id, beijing_snapshot_id, xingwang_snapshot_id, status,
+                (snapshot_date, template_version_id, mapping_version_id, beijing_snapshot_id, xingwang_snapshot_id, status,
                  calculated_at, threshold_growth, threshold_moh30, threshold_moh90, beijing_codes_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot_text,
                 template_version_id,
+                mapping_version_id,
                 beijing_snapshot_id,
                 xingwang_snapshot_id,
                 status,
@@ -586,7 +748,9 @@ class Database:
             self.connection.execute("DELETE FROM tracking_meta WHERE snapshot_date = ?", (snapshot_text,))
             for snapshot_id in ids:
                 self.connection.execute("DELETE FROM beijing_inventory WHERE snapshot_id = ?", (snapshot_id,))
+                self.connection.execute("DELETE FROM beijing_source_inventory WHERE snapshot_id = ?", (snapshot_id,))
                 self.connection.execute("DELETE FROM xingwang_inventory WHERE snapshot_id = ?", (snapshot_id,))
+                self.connection.execute("DELETE FROM xingwang_source_inventory WHERE snapshot_id = ?", (snapshot_id,))
                 self.connection.execute("DELETE FROM inventory_snapshots WHERE id = ?", (snapshot_id,))
             self.connection.execute(
                 """

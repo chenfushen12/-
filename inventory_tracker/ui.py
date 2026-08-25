@@ -13,7 +13,14 @@ from tkcalendar import DateEntry
 from .config import ConfigStore
 from .charting import ChartMode, ChartSelection, METRIC_LABELS, METRICS_BY_MODE, build_chart_figure, format_hover_text
 from .dashboard import highest_alert_label, toggle_alert_filter
-from .importers import preview_beijing, preview_sales, preview_template, preview_xingwang
+from .importers import (
+    normalize_import_previews,
+    preview_beijing,
+    preview_code_mapping,
+    preview_sales,
+    preview_template,
+    preview_xingwang,
+)
 from .service import InventoryTrackerService, OverlapError, OverwriteRequired, ValidationError
 
 
@@ -22,7 +29,16 @@ IMPORT_KIND_LABELS = {
     "sales": "销售数据",
     "beijing": "北京库存",
     "xingwang": "星望库存",
+    "code_mapping": "新旧编码替换表",
 }
+
+IMPORT_FIELDS = (
+    ("template", "商品主模板"),
+    ("sales", "销售数据"),
+    ("beijing", "北京库存"),
+    ("xingwang", "星望库存"),
+    ("code_mapping", "新旧编码替换表（可选）"),
+)
 
 ISSUE_LEVEL_LABELS = {
     "blocking": "阻断",
@@ -332,17 +348,17 @@ class InventoryApp:
         form = ttk.Frame(self.import_tab)
         form.pack(fill="x")
         self.file_vars: dict[str, tk.StringVar] = {}
-        fields = [("template", "商品主模板"), ("sales", "销售数据"), ("beijing", "北京库存"), ("xingwang", "星望库存")]
-        for row, (key, label) in enumerate(fields):
+        for row, (key, label) in enumerate(IMPORT_FIELDS):
             ttk.Label(form, text=label, width=14).grid(row=row, column=0, sticky="w", pady=5)
             variable = tk.StringVar()
             self.file_vars[key] = variable
             ttk.Entry(form, textvariable=variable, width=90).grid(row=row, column=1, sticky="ew", padx=4)
             ttk.Button(form, text="选择文件", command=lambda name=key: self._choose_file(name)).grid(row=row, column=2, padx=4)
-        ttk.Label(form, text="库存快照日", width=14).grid(row=4, column=0, sticky="w", pady=5)
+        snapshot_row = len(IMPORT_FIELDS)
+        ttk.Label(form, text="库存快照日", width=14).grid(row=snapshot_row, column=0, sticky="w", pady=5)
         self.snapshot_date = DateEntry(form, date_pattern="yyyy/mm/dd", locale="zh_CN", maxdate=date.today(), width=14)
         self.snapshot_date.set_date(date.today() - timedelta(days=1))
-        self.snapshot_date.grid(row=4, column=1, sticky="w", padx=4)
+        self.snapshot_date.grid(row=snapshot_row, column=1, sticky="w", padx=4)
         self.snapshot_date.bind("<<DateEntrySelected>>", self._invalidate_preview_for_date)
         self.snapshot_date.bind("<FocusOut>", self._invalidate_preview_for_date)
         form.columnconfigure(1, weight=1)
@@ -358,7 +374,7 @@ class InventoryApp:
         self.import_progress.pack(side="left", padx=12)
         self.progress_var = tk.StringVar(value="")
         ttk.Label(options, textvariable=self.progress_var, width=24).pack(side="left")
-        self.import_status = tk.StringVar(value="请选择四个 Excel 文件并执行预检查")
+        self.import_status = tk.StringVar(value="请选择四个业务 Excel；新旧编码替换表可选")
         ttk.Label(self.import_tab, textvariable=self.import_status, foreground="#375a7f").pack(anchor="w", pady=8)
         self.preview_text = tk.Text(self.import_tab, height=22, wrap="word")
         self.preview_text.pack(fill="both", expand=True)
@@ -527,7 +543,7 @@ class InventoryApp:
         ttk.Button(form, text="保存设置", command=self._save_settings).grid(row=4, column=1, sticky="w", pady=12)
 
     def _choose_file(self, key: str) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")])
+        path = filedialog.askopenfilename(filetypes=[("Excel / CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")])
         if path:
             self.file_vars[key].set(path)
 
@@ -584,19 +600,28 @@ class InventoryApp:
         try:
             snapshot_date = _parse_date(self.snapshot_date.get())
             paths = {key: variable.get().strip() for key, variable in self.file_vars.items()}
-            if not all(paths.values()):
+            required_paths = (paths["template"], paths["sales"], paths["beijing"], paths["xingwang"])
+            if not all(required_paths):
                 raise ValueError("四个 Excel 文件都必须选择")
             def work(progress):
-                progress(5, "读取商品主模板…")
+                mapping = None
+                if paths["code_mapping"]:
+                    progress(5, "读取新旧编码替换表…")
+                    mapping = preview_code_mapping(paths["code_mapping"])
+                else:
+                    mapping = self.service.active_mapping_preview()
+                progress(15, "读取商品主模板…")
                 template = preview_template(paths["template"])
-                progress(30, "读取销售数据…")
+                progress(35, "读取销售数据…")
                 sales = preview_sales(paths["sales"])
-                progress(55, "读取北京库存…")
+                progress(60, "读取北京库存…")
                 beijing = preview_beijing(paths["beijing"], codes=self.service.config.beijing_codes)
                 progress(80, "读取星望库存…")
                 xingwang = preview_xingwang(paths["xingwang"])
+                normalized = normalize_import_previews(template, sales, beijing, xingwang, mapping)
                 progress(100, "预检查完成")
-                return snapshot_date, (template, sales, beijing, xingwang)
+                displayed_mapping = mapping if paths["code_mapping"] else None
+                return snapshot_date, normalized + ((displayed_mapping,) if displayed_mapping is not None else ())
 
             self.import_status.set("后台读取中，窗口仍可操作…")
             self._start_background_task(work, self._apply_preview_result)
@@ -657,7 +682,7 @@ class InventoryApp:
                 if not self._confirm_action("覆盖已有快照", summary, "覆盖已有快照"):
                     return
                 overwrite = True
-            elif not self._confirm_action("确认导入", "确认写入四类数据并生成库存快照吗？", "确认导入并计算"):
+            elif not self._confirm_action("确认导入", "确认写入四类业务数据，并按当前替换表生成库存快照吗？", "确认导入并计算"):
                 return
 
             def work(progress):
